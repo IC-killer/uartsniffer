@@ -1,2 +1,4 @@
 uartsniffer.exe
 sniff.log
+compile_commands.json
+*.o

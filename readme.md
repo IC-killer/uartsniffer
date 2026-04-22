@@ -11,17 +11,18 @@
 
 ## 使用
 
-- 创建一对虚拟串口
 - 普通监听：`./uartsniffer.exe -i COM6 -o COM7 -b 115200`
 - 带解析器监听：`sniffer.exe -i COM6 -o COM7 -b 115200 -c e.cfg`
 
-![png](./1.png)
+![png1](./1.png)
+![png2](./2.png)
 
 **设计思路：**
 
 - `{...}` 过滤条件：`len=N`、`idx3=0x05`、可组合（AND逻辑）
-- `[type(label)]` 解析字段：按顺序消耗字节
+- `[type(label)]` 解析字段：按顺序消耗字节, label解析注解
 - 多行规则
+- 配置热重载
 
 **`-c` 解析器配置文件语法规则：**
 
@@ -32,6 +33,8 @@
 | `{len=9, idx0=0x01, idx2=0x05}` | 多条件 AND 组合 |
 | `[u16(voltage)]` | 解析 2 字节 LE uint16，标签为 voltage |
 | `[s16be(speed)]` | 解析 2 字节 BE int16 |
+| `[s16be(speed)]` | 解析 2 字节 BE int16 |
+| `[array-12(string)]` | 一个长12的数组 |
 | `# rule_name` | 行末注释作为规则名称显示 |
 
-**支持的数据类型：** `u8 s8 u16 s16 u16be s16be u32 s32 u32be s32be float double`
+**支持的数据类型：** `u8 s8 u16 s16 u16be s16be u32 s32 u32be s32be float double array`

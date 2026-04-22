@@ -1,5 +1,6 @@
 uartsniffer.exe
 sniff.log
+m.cfg
 compile_commands.json
 *.o
 .cache/

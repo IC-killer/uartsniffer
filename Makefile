@@ -40,7 +40,7 @@ ifeq ($(PLATFORM),Linux)
 else
     # Windows (MSYS2/MinGW or cross-compile)
     LDFLAGS_CLI  = -lkernel32 -lsetupapi -luuid
-    LDFLAGS_GUI  = -lSDL2 -lopengl32 -lkernel32 -lsetupapi -luuid -mwindows
+    LDFLAGS_GUI  = -lSDL2 -lopengl32 -lkernel32 -lsetupapi -luuid -lcomdlg32 -mwindows
     CLI_EXE      = uartsniffer.exe
     GUI_EXE      = uartsniffer-gui.exe
 endif

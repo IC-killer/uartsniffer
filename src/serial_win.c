@@ -11,6 +11,58 @@
 
 /* ── port enumeration ────────────────────────────────────────────────────── */
 
+static char *serial_strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *out = (char *)malloc(n);
+    if (out) memcpy(out, s, n);
+    return out;
+}
+
+static int is_com_prefix(const char *p) {
+    return ((p[0] == 'C' || p[0] == 'c') &&
+            (p[1] == 'O' || p[1] == 'o') &&
+            (p[2] == 'M' || p[2] == 'm') &&
+            (p[3] >= '0' && p[3] <= '9'));
+}
+
+static int extract_com_name(const char *friendly, char *port, int portsz) {
+    const char *p = friendly;
+    while (*p) {
+        if (is_com_prefix(p)) {
+            int len = 0;
+            while (p[len] && len < portsz - 1 &&
+                   p[len] != ')' && p[len] != '(' &&
+                   p[len] != ' ' && p[len] != '\t') {
+                port[len] = p[len];
+                len++;
+            }
+            port[len] = '\0';
+            return len > 0;
+        }
+        p++;
+    }
+    return 0;
+}
+
+static int get_port_name_from_registry(HDEVINFO devInfo,
+                                       SP_DEVINFO_DATA *devData,
+                                       char *port, int portsz) {
+    HKEY key = SetupDiOpenDevRegKey(devInfo, devData, DICS_FLAG_GLOBAL, 0,
+                                    DIREG_DEV, KEY_READ);
+    if (key == INVALID_HANDLE_VALUE)
+        return 0;
+
+    DWORD type = REG_SZ;
+    DWORD size = (DWORD)portsz;
+    LONG rc = RegQueryValueExA(key, "PortName", NULL, &type,
+                               (BYTE *)port, &size);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS || type != REG_SZ || !is_com_prefix(port))
+        return 0;
+    port[portsz - 1] = '\0';
+    return 1;
+}
+
 int usp_serial_list(char **buf, int max) {
     int count = 0;
     HDEVINFO devInfo = SetupDiGetClassDevsA(
@@ -24,22 +76,20 @@ int usp_serial_list(char **buf, int max) {
          SetupDiEnumDeviceInfo(devInfo, i, &devData); i++) {
 
         char friendly[256] = {0};
-        SetupDiGetDeviceRegistryPropertyA(
-            devInfo, &devData, SPDRP_FRIENDLYNAME,
-            NULL, (BYTE *)friendly, sizeof(friendly) - 1, NULL);
+        char port[MAX_PORT_LEN] = {0};
 
-        char *start = strstr(friendly, "COM");
-        if (!start) start = strstr(friendly, "com");
-        if (start) {
-            char port[MAX_PORT_LEN];
-            int plen = 0;
-            char *p = start;
-            while (*p && plen < MAX_PORT_LEN - 1 &&
-                   (*p != ' ' && *p != ')' && *p != '(')) {
-                port[plen++] = *p++;
-            }
-            port[plen] = '\0';
-            buf[count] = strdup(port);
+        if (!get_port_name_from_registry(devInfo, &devData,
+                                         port, sizeof(port))) {
+            SetupDiGetDeviceRegistryPropertyA(
+                devInfo, &devData, SPDRP_FRIENDLYNAME,
+                NULL, (BYTE *)friendly, sizeof(friendly) - 1, NULL);
+            extract_com_name(friendly, port, sizeof(port));
+        }
+
+        if (port[0]) {
+            buf[count] = serial_strdup(port);
+            if (!buf[count])
+                break;
             count++;
         }
     }

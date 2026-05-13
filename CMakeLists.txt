@@ -50,6 +50,7 @@ if(SDL2_FOUND)
         target_compile_definitions(uartsniffer-gui PRIVATE _GNU_SOURCE)
     endif()
     if(WIN32)
+        target_link_libraries(uartsniffer-gui PRIVATE comdlg32)
         set_target_properties(uartsniffer-gui PROPERTIES
             WIN32_EXECUTABLE TRUE
         )

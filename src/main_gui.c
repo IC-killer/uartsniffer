@@ -53,6 +53,7 @@
 
 #ifdef _WIN32
   #include <windows.h>
+  #include <commdlg.h>
 #else
   #include <pthread.h>
   #include <unistd.h>
@@ -87,6 +88,8 @@
    ========================================================================== */
 
 #define RING_CAPACITY 2048
+#define GUI_MAX_PORTS 64
+#define OUTPUT_HISTORY_CAPACITY 4096
 
 typedef struct {
     char text[512];
@@ -105,6 +108,7 @@ typedef struct {
 } ring_t;
 
 static ring_t g_ring;
+static struct nk_context *nk_ctx;
 
 static void ring_init(ring_t *r) {
     memset(r, 0, sizeof(*r));
@@ -177,8 +181,8 @@ static int ansi_to_color(const char *p, const char **end) {
 
     switch (code) {
     case 0:  return 0;   /* reset → default */
-    case 1:  return -1;  /* bold – ignore for now */
-    case 2:  return -1;  /* dim */
+    case 1:  return -2;  /* bold – skip */
+    case 2:  return -2;  /* dim – skip */
     case 90: return 1;   /* gray */
     case 91: return 2;   /* red */
     case 92: return 3;   /* green */
@@ -187,7 +191,7 @@ static int ansi_to_color(const char *p, const char **end) {
     case 95: return 6;   /* magenta */
     case 96: return 7;   /* cyan */
     case 97: return 8;   /* white */
-    default: return -1;
+    default: return -2;  /* recognized ANSI SGR, but not color-mapped */
     }
 }
 
@@ -200,10 +204,11 @@ static void output_ansi_lines(ring_t *r, const char *text) {
 
     while (*p) {
         if (*p == '\x1b') {
-            const char *end;
+            const char *end = p;
             int c = ansi_to_color(p, &end);
-            if (c >= 0) {
-                active_color = c;
+            if (end != p) {
+                if (c >= 0)
+                    active_color = c;
                 p = end;
                 continue;
             }
@@ -273,10 +278,20 @@ typedef struct {
     char  cfg_path[256];
     int   rule_count;
 
+    /* discovered ports */
+    char  ports[GUI_MAX_PORTS][MAX_PORT_LEN];
+    int   port_count;
+
     /* status */
     int   running;
     int   byte_count_in;
     int   byte_count_out;
+
+    /* persistent output view */
+    ring_slot_t output[OUTPUT_HISTORY_CAPACITY];
+    int   output_start;
+    int   output_count;
+    int   auto_scroll_output;
 
     /* handles */
     usp_serial_t   hIn;
@@ -286,6 +301,142 @@ typedef struct {
     thread_t       thread_ba;
     Config         cfg;
 } gui_state_t;
+
+static void gui_output_append(gui_state_t *gs, const ring_slot_t *slot) {
+    int idx;
+    if (gs->output_count < OUTPUT_HISTORY_CAPACITY) {
+        idx = (gs->output_start + gs->output_count) % OUTPUT_HISTORY_CAPACITY;
+        gs->output_count++;
+    } else {
+        idx = gs->output_start;
+        gs->output_start = (gs->output_start + 1) % OUTPUT_HISTORY_CAPACITY;
+    }
+    gs->output[idx] = *slot;
+}
+
+static int gui_output_drain(gui_state_t *gs) {
+    int added = 0;
+    ring_slot_t slot;
+    while (ring_pop(&g_ring, &slot)) {
+        gui_output_append(gs, &slot);
+        added++;
+    }
+    return added;
+}
+
+static void gui_output_clear(gui_state_t *gs) {
+    gs->output_start = 0;
+    gs->output_count = 0;
+}
+
+static int gui_port_exists(gui_state_t *gs, const char *port) {
+    for (int i = 0; i < gs->port_count; i++) {
+        if (!strcmp(gs->ports[i], port))
+            return 1;
+    }
+    return 0;
+}
+
+static void gui_scan_ports(gui_state_t *gs) {
+    char *ports[GUI_MAX_PORTS];
+    int n = usp_serial_list(ports, GUI_MAX_PORTS);
+
+    gs->port_count = 0;
+    ring_push(&g_ring, "Scanning ports...\n", 5);
+    for (int i = 0; i < n; i++) {
+        if (ports[i] && ports[i][0] && !gui_port_exists(gs, ports[i]) &&
+            gs->port_count < GUI_MAX_PORTS) {
+            snprintf(gs->ports[gs->port_count], MAX_PORT_LEN, "%s", ports[i]);
+            gs->port_count++;
+        }
+        free(ports[i]);
+    }
+
+    if (gs->port_count == 0) {
+        ring_push(&g_ring, "  no serial ports found\n", 2);
+        return;
+    }
+
+    for (int i = 0; i < gs->port_count; i++) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "  found: %s\n", gs->ports[i]);
+        ring_push(&g_ring, msg, 1);
+    }
+
+    if (!gs->portIn[0])
+        snprintf(gs->portIn, sizeof(gs->portIn), "%s", gs->ports[0]);
+    if (!gs->portOut[0] && gs->port_count > 1)
+        snprintf(gs->portOut, sizeof(gs->portOut), "%s", gs->ports[1]);
+}
+
+static void gui_port_dropdown(gui_state_t *gs, char *target, size_t target_size,
+                              const char *empty_label) {
+    const char *label = target[0] ? target : empty_label;
+    if (nk_combo_begin_label(nk_ctx, label, nk_vec2(180, 220))) {
+        nk_layout_row_dynamic(nk_ctx, 20, 1);
+        if (gs->port_count == 0) {
+            nk_label(nk_ctx, "Scan first", NK_TEXT_LEFT);
+        } else {
+            for (int i = 0; i < gs->port_count; i++) {
+                if (nk_combo_item_label(nk_ctx, gs->ports[i], NK_TEXT_LEFT)) {
+                    snprintf(target, target_size, "%s", gs->ports[i]);
+                    nk_combo_close(nk_ctx);
+                }
+            }
+        }
+        nk_combo_end(nk_ctx);
+    }
+}
+
+static void gui_load_cfg(gui_state_t *gs) {
+    if (!gs->cfg_path[0]) {
+        ring_push(&g_ring, "CFG path is empty\n", 2);
+        return;
+    }
+
+    int n = usp_ruleset_load(gs->cfg_path);
+    if (n >= 0) {
+        gs->rule_count = n;
+        char msg[320];
+        snprintf(msg, sizeof(msg), "CFG loaded: %s (%d rule(s))\n",
+                 gs->cfg_path, n);
+        ring_push(&g_ring, msg, 3);
+    } else {
+        ring_push(&g_ring, "CFG load failed!\n", 2);
+    }
+}
+
+static void gui_browse_cfg(gui_state_t *gs) {
+#ifdef _WIN32
+    char path[sizeof(gs->cfg_path)];
+    OPENFILENAMEA ofn;
+    memset(path, 0, sizeof(path));
+    snprintf(path, sizeof(path), "%s", gs->cfg_path);
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = sizeof(path);
+    ofn.lpstrFilter = "Config Files\0*.cfg;*.txt\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (GetOpenFileNameA(&ofn)) {
+        snprintf(gs->cfg_path, sizeof(gs->cfg_path), "%s", path);
+        gui_load_cfg(gs);
+    } else {
+        DWORD err = CommDlgExtendedError();
+        if (err) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Open file dialog failed: 0x%08lX\n",
+                     (unsigned long)err);
+            ring_push(&g_ring, msg, 2);
+        }
+    }
+#else
+    ring_push(&g_ring, "Browse is only implemented on Windows; type the path manually\n", 4);
+#endif
+}
 
 /* ==========================================================================
    Config file watcher callback  (called from watcher thread)
@@ -342,7 +493,6 @@ static THREAD_RET forward_thread_gui(THREAD_ARG param) {
    SDL2 → Nuklear glue  (standard boilerplate)
    ========================================================================== */
 
-static struct nk_context *nk_ctx;
 static SDL_Window        *win;
 static SDL_GLContext       gl_ctx;
 static int                 win_w = 1100, win_h = 650;
@@ -410,32 +560,35 @@ static void gui_panel_serial(gui_state_t *gs) {
     nk_layout_row_dynamic(nk_ctx, 24, 1);
     nk_label(nk_ctx, "Serial Ports", NK_TEXT_LEFT);
 
-    /* IN port – use dynamic cols: label / edit / button */
-    nk_layout_row_dynamic(nk_ctx, 22, 3);
+    /* IN port: manual edit plus scanned-port dropdown */
+    nk_layout_row_begin(nk_ctx, NK_STATIC, 24, 4);
+    nk_layout_row_push(nk_ctx, 32);
     nk_label(nk_ctx, "IN:", NK_TEXT_LEFT);
+    nk_layout_row_push(nk_ctx, 118);
     nk_edit_string_zero_terminated(nk_ctx, NK_EDIT_SIMPLE,
                                     gs->portIn, MAX_PORT_LEN,
                                     nk_filter_default);
+    nk_layout_row_push(nk_ctx, 112);
+    gui_port_dropdown(gs, gs->portIn, sizeof(gs->portIn), "Select IN");
+    nk_layout_row_push(nk_ctx, 54);
     if (nk_button_label(nk_ctx, "Scan")) {
-        char *ports[32];
-        int n = usp_serial_list(ports, 32);
-        ring_push(&g_ring, "Scanning ports...\n", 5);
-        for (int i = 0; i < n; i++) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "  found: %s\n", ports[i]);
-            ring_push(&g_ring, msg, 1);
-            free(ports[i]);
-        }
-        if (n == 0) ring_push(&g_ring, "  (none found)\n", 2);
+        gui_scan_ports(gs);
     }
+    nk_layout_row_end(nk_ctx);
 
-    /* OUT port: label / edit / spacer */
-    nk_layout_row_dynamic(nk_ctx, 22, 3);
+    /* OUT port: manual edit plus scanned-port dropdown */
+    nk_layout_row_begin(nk_ctx, NK_STATIC, 24, 4);
+    nk_layout_row_push(nk_ctx, 32);
     nk_label(nk_ctx, "OUT:", NK_TEXT_LEFT);
+    nk_layout_row_push(nk_ctx, 118);
     nk_edit_string_zero_terminated(nk_ctx, NK_EDIT_SIMPLE,
                                     gs->portOut, MAX_PORT_LEN,
                                     nk_filter_default);
+    nk_layout_row_push(nk_ctx, 112);
+    gui_port_dropdown(gs, gs->portOut, sizeof(gs->portOut), "Select OUT");
+    nk_layout_row_push(nk_ctx, 54);
     nk_spacer(nk_ctx);
+    nk_layout_row_end(nk_ctx);
 
     /* Baud: label / edit / combo */
     nk_layout_row_dynamic(nk_ctx, 22, 3);
@@ -478,9 +631,7 @@ static void gui_panel_parser(gui_state_t *gs) {
                                     nk_filter_default);
     nk_layout_row_dynamic(nk_ctx, 22, 1);
     if (nk_button_label(nk_ctx, "Browse...")) {
-        /* SDL2 doesn't have native file dialogs; just type the path */
-        /* In a real app use tinyfiledialogs or platform dialogs */
-        /* For now, user types the path manually */
+        gui_browse_cfg(gs);
     }
 
     /* rule count */
@@ -489,11 +640,7 @@ static void gui_panel_parser(gui_state_t *gs) {
     nk_label(nk_ctx, rbuf, NK_TEXT_LEFT);
 
     if (nk_button_label(nk_ctx, "Reload CFG")) {
-        if (gs->cfg_path[0]) {
-            int n = usp_ruleset_load(gs->cfg_path);
-            if (n >= 0) gs->rule_count = n;
-            else ring_push(&g_ring, "CFG load failed!\n", 2);
-        }
+        gui_load_cfg(gs);
     }
 }
 
@@ -595,6 +742,7 @@ static void gui_panel_control(gui_state_t *gs) {
 #else
         pthread_mutex_unlock(&g_ring.lock);
 #endif
+        gui_output_clear(gs);
     }
 
     /* status line */
@@ -610,17 +758,29 @@ static void gui_panel_control(gui_state_t *gs) {
     }
 }
 
-static void gui_panel_output(void) {
-    nk_layout_row_dynamic(nk_ctx, 24, 1);
-    nk_label(nk_ctx, "Output", NK_TEXT_LEFT);
+static void gui_panel_output(gui_state_t *gs) {
+    int added = gui_output_drain(gs);
 
-    /* consume ring buffer entries */
-    ring_slot_t slot;
-    while (ring_pop(&g_ring, &slot)) {
-        struct nk_color c = gui_colors[slot.color % 9];
+    nk_layout_row_begin(nk_ctx, NK_STATIC, 24, 3);
+    nk_layout_row_push(nk_ctx, 80);
+    nk_label(nk_ctx, "Output", NK_TEXT_LEFT);
+    nk_layout_row_push(nk_ctx, 120);
+    nk_checkbox_label(nk_ctx, "Auto-scroll", &gs->auto_scroll_output);
+    nk_layout_row_push(nk_ctx, 80);
+    if (nk_button_label(nk_ctx, "Bottom"))
+        nk_group_set_scroll(nk_ctx, "output_panel", 0, 0x7fffffffU);
+    nk_layout_row_end(nk_ctx);
+
+    for (int i = 0; i < gs->output_count; i++) {
+        int idx = (gs->output_start + i) % OUTPUT_HISTORY_CAPACITY;
+        ring_slot_t *slot = &gs->output[idx];
+        struct nk_color c = gui_colors[slot->color % 9];
         nk_layout_row_dynamic(nk_ctx, 18, 1);
-        nk_label_colored(nk_ctx, slot.text, NK_TEXT_LEFT, c);
+        nk_label_colored(nk_ctx, slot->text, NK_TEXT_LEFT, c);
     }
+
+    if (added && gs->auto_scroll_output)
+        nk_group_set_scroll(nk_ctx, "output_panel", 0, 0x7fffffffU);
 }
 
 /* ==========================================================================
@@ -639,10 +799,11 @@ int main(int argc, char *argv[]) {
     ring_init(&g_ring);
     usp_set_output(gui_out_cb, gui_err_cb, &g_ring);
 
-    gui_state_t gs;
+    static gui_state_t gs;
     memset(&gs, 0, sizeof(gs));
     strcpy(gs.baud_text, "9600");
     gs.baud = 9600;
+    gs.auto_scroll_output = 1;
 
     nuklear_sdl_init();
 
@@ -677,7 +838,7 @@ int main(int argc, char *argv[]) {
                 {
                     if (nk_group_begin(nk_ctx, "output_panel",
                                        NK_WINDOW_BORDER)) {
-                        gui_panel_output();
+                        gui_panel_output(&gs);
                         nk_group_end(nk_ctx);
                     }
                 }

@@ -92,6 +92,7 @@
 #define OUTPUT_TEXT_CAPACITY (256 * 1024)
 #define OUTPUT_PACKET_CAPACITY 128
 #define PACKET_HEX_CAPACITY (BUF_SIZE * 3 + 1)
+#define OUTPUT_TOOLBAR_ID "output_toolbar"
 #define OUTPUT_PANEL_ID "output_panel"
 #define SELECTABLE_LOG_PANEL_ID "selectable_log_panel"
 
@@ -679,6 +680,43 @@ static SDL_GLContext       gl_ctx;
 static int                 win_w = 1100, win_h = 650;
 static struct nk_font     *default_font;
 
+static void gui_style_toggles(struct nk_context *ctx) {
+    struct nk_style_toggle *toggle;
+    struct nk_color off_bg = nk_rgb(34, 39, 46);
+    struct nk_color off_hover = nk_rgb(48, 56, 66);
+    struct nk_color border = nk_rgb(170, 185, 200);
+    struct nk_color mark = nk_rgb(50, 220, 130);
+    struct nk_color text = nk_rgb(230, 235, 240);
+
+    toggle = &ctx->style.checkbox;
+    toggle->normal = nk_style_item_color(off_bg);
+    toggle->hover = nk_style_item_color(off_hover);
+    toggle->active = nk_style_item_color(off_hover);
+    toggle->cursor_normal = nk_style_item_color(mark);
+    toggle->cursor_hover = nk_style_item_color(nk_rgb(80, 245, 155));
+    toggle->border_color = border;
+    toggle->border = 1.5f;
+    toggle->padding = nk_vec2(3.0f, 3.0f);
+    toggle->spacing = 6.0f;
+    toggle->text_normal = text;
+    toggle->text_hover = nk_rgb(255, 255, 255);
+    toggle->text_active = nk_rgb(255, 255, 255);
+
+    toggle = &ctx->style.option;
+    toggle->normal = nk_style_item_color(off_bg);
+    toggle->hover = nk_style_item_color(off_hover);
+    toggle->active = nk_style_item_color(off_hover);
+    toggle->cursor_normal = nk_style_item_color(mark);
+    toggle->cursor_hover = nk_style_item_color(nk_rgb(80, 245, 155));
+    toggle->border_color = border;
+    toggle->border = 1.5f;
+    toggle->padding = nk_vec2(3.0f, 3.0f);
+    toggle->spacing = 6.0f;
+    toggle->text_normal = text;
+    toggle->text_hover = nk_rgb(255, 255, 255);
+    toggle->text_active = nk_rgb(255, 255, 255);
+}
+
 static void nuklear_sdl_init(void) {
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
@@ -713,6 +751,7 @@ static void nuklear_sdl_init(void) {
         if (default_font)
             nk_style_set_font(nk_ctx, &default_font->handle);
     }
+    gui_style_toggles(nk_ctx);
 }
 
 static void nuklear_sdl_shutdown(void) {
@@ -954,10 +993,7 @@ static void gui_panel_control(gui_state_t *gs) {
     }
 }
 
-static void gui_panel_output(gui_state_t *gs) {
-    output_packet_t packet_view[OUTPUT_PACKET_CAPACITY];
-    int packet_count;
-
+static void gui_output_toolbar(gui_state_t *gs) {
     nk_layout_row_begin(nk_ctx, NK_STATIC, 24, 4);
     nk_layout_row_push(nk_ctx, 80);
     nk_label(nk_ctx, "Output", NK_TEXT_LEFT);
@@ -973,6 +1009,11 @@ static void gui_panel_output(gui_state_t *gs) {
     if (nk_button_label(nk_ctx, "Bottom"))
         gui_output_scroll_to_bottom(gs);
     nk_layout_row_end(nk_ctx);
+}
+
+static void gui_panel_output(gui_state_t *gs) {
+    output_packet_t packet_view[OUTPUT_PACKET_CAPACITY];
+    int packet_count;
 
     nk_layout_row_dynamic(nk_ctx, 20, 1);
     nk_label(nk_ctx, "Recent raw packets", NK_TEXT_LEFT);
@@ -1060,17 +1101,22 @@ int main(int argc, char *argv[]) {
                 float right_w = (float)win_w - left_w - 20.0f;
                 float panel_h = (float)win_h - 72.0f;
                 float gap_h = 8.0f;
+                float toolbar_h = 32.0f;
                 float split_h;
                 float output_h;
                 float log_h;
                 int added;
-                if (right_w < 100.0f) right_w = 100.0f;
+                if (right_w < 420.0f) right_w = 420.0f;
                 if (panel_h < 120.0f) panel_h = 120.0f;
 
-                split_h = panel_h - gap_h;
+                if (panel_h < toolbar_h + 80.0f)
+                    toolbar_h = 24.0f;
+                split_h = panel_h - toolbar_h - gap_h;
                 if (split_h < 80.0f) {
                     gap_h = 0.0f;
-                    split_h = panel_h;
+                    split_h = panel_h - toolbar_h;
+                    if (split_h < 40.0f)
+                        split_h = 40.0f;
                 }
                 output_h = split_h * 0.46f;
                 if (split_h >= 300.0f) {
@@ -1085,7 +1131,7 @@ int main(int argc, char *argv[]) {
                 if (added && gs.auto_scroll_output)
                     gui_output_scroll_to_bottom(&gs);
 
-                nk_layout_space_begin(nk_ctx, NK_STATIC, panel_h, 3);
+                nk_layout_space_begin(nk_ctx, NK_STATIC, panel_h, 4);
                 nk_layout_space_push(nk_ctx, nk_rect(0, 0, left_w, panel_h));
                 if (nk_group_begin(nk_ctx, "left_panel", NK_WINDOW_BORDER)) {
                     gui_panel_serial(&gs);
@@ -1097,13 +1143,22 @@ int main(int argc, char *argv[]) {
                 }
 
                 nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f, 0,
+                                                     right_w, toolbar_h));
+                if (nk_group_begin(nk_ctx, OUTPUT_TOOLBAR_ID,
+                                   NK_WINDOW_NO_SCROLLBAR)) {
+                    gui_output_toolbar(&gs);
+                    nk_group_end(nk_ctx);
+                }
+
+                nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f, toolbar_h,
                                                      right_w, output_h));
                 if (nk_group_begin(nk_ctx, OUTPUT_PANEL_ID, NK_WINDOW_BORDER)) {
                     gui_panel_output(&gs);
                     nk_group_end(nk_ctx);
                 }
 
-                nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f, output_h + gap_h,
+                nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f,
+                                                     toolbar_h + output_h + gap_h,
                                                      right_w, log_h));
                 if (nk_group_begin(nk_ctx, SELECTABLE_LOG_PANEL_ID,
                                    NK_WINDOW_BORDER)) {

@@ -1,4 +1,5 @@
 uartsniffer.exe
+uartsniffer-gui.exe
 sniff.log
 m.cfg
 compile_commands.json

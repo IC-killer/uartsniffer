@@ -1,0 +1,60 @@
+cmake_minimum_required(VERSION 3.10)
+project(uartsniffer LANGUAGES C)
+
+set(CMAKE_C_STANDARD 11)
+
+# ── common sources ─────────────────────────────────────────────────────────
+
+set(COMMON_SRCS
+    src/uspy.c
+    src/parser.c
+    src/serial_win.c
+    src/serial_linux.c
+    src/watch_win.c
+    src/watch_linux.c
+)
+
+# ── CLI target ─────────────────────────────────────────────────────────────
+
+add_executable(uartsniffer
+    ${COMMON_SRCS}
+    src/main_cli.c
+)
+
+target_include_directories(uartsniffer PRIVATE src)
+
+if(WIN32)
+    target_link_libraries(uartsniffer PRIVATE kernel32)
+else()
+    target_link_libraries(uartsniffer PRIVATE pthread)
+    target_compile_definitions(uartsniffer PRIVATE _GNU_SOURCE)
+endif()
+
+# ── GUI target (requires SDL2 + Nuklear) ───────────────────────────────────
+
+find_package(SDL2 QUIET)
+if(SDL2_FOUND)
+    add_executable(uartsniffer-gui
+        ${COMMON_SRCS}
+        src/main_gui.c
+    )
+    target_include_directories(uartsniffer-gui PRIVATE
+        src ${CMAKE_SOURCE_DIR}/vendor
+    )
+    target_link_libraries(uartsniffer-gui PRIVATE
+        SDL2::SDL2
+        ${OPENGL_LIBRARIES}
+    )
+    if(UNIX)
+        target_link_libraries(uartsniffer-gui PRIVATE pthread)
+        target_compile_definitions(uartsniffer-gui PRIVATE _GNU_SOURCE)
+    endif()
+    if(WIN32)
+        target_link_libraries(uartsniffer-gui PRIVATE comdlg32)
+        set_target_properties(uartsniffer-gui PROPERTIES
+            WIN32_EXECUTABLE TRUE
+        )
+    endif()
+else()
+    message(STATUS "SDL2 not found – GUI target skipped.")
+endif()

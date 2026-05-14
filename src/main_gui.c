@@ -89,7 +89,9 @@
 
 #define RING_CAPACITY 2048
 #define GUI_MAX_PORTS 64
-#define OUTPUT_HISTORY_CAPACITY 4096
+#define OUTPUT_TEXT_CAPACITY (256 * 1024)
+#define OUTPUT_PACKET_CAPACITY 128
+#define PACKET_HEX_CAPACITY (BUF_SIZE * 3 + 1)
 
 typedef struct {
     char text[512];
@@ -107,8 +109,53 @@ typedef struct {
 #endif
 } ring_t;
 
+typedef struct {
+    char title[160];
+    char hex[PACKET_HEX_CAPACITY];
+    unsigned len;
+    int color;
+} output_packet_t;
+
 static ring_t g_ring;
 static struct nk_context *nk_ctx;
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_packet_lock;
+#else
+static pthread_mutex_t g_packet_lock;
+#endif
+
+static void packet_lock_init(void) {
+#ifdef _WIN32
+    InitializeCriticalSection(&g_packet_lock);
+#else
+    pthread_mutex_init(&g_packet_lock, NULL);
+#endif
+}
+
+static void packet_lock_destroy(void) {
+#ifdef _WIN32
+    DeleteCriticalSection(&g_packet_lock);
+#else
+    pthread_mutex_destroy(&g_packet_lock);
+#endif
+}
+
+static void packet_lock_enter(void) {
+#ifdef _WIN32
+    EnterCriticalSection(&g_packet_lock);
+#else
+    pthread_mutex_lock(&g_packet_lock);
+#endif
+}
+
+static void packet_lock_leave(void) {
+#ifdef _WIN32
+    LeaveCriticalSection(&g_packet_lock);
+#else
+    pthread_mutex_unlock(&g_packet_lock);
+#endif
+}
 
 static void ring_init(ring_t *r) {
     memset(r, 0, sizeof(*r));
@@ -288,9 +335,14 @@ typedef struct {
     int   byte_count_out;
 
     /* persistent output view */
-    ring_slot_t output[OUTPUT_HISTORY_CAPACITY];
-    int   output_start;
-    int   output_count;
+    char  output_text[OUTPUT_TEXT_CAPACITY];
+    int   output_text_len;
+    struct nk_text_edit output_edit;
+    int   output_edit_ready;
+    int   output_edit_sync;
+    output_packet_t packets[OUTPUT_PACKET_CAPACITY];
+    int   packet_start;
+    int   packet_count;
     int   auto_scroll_output;
 
     /* handles */
@@ -302,31 +354,149 @@ typedef struct {
     Config         cfg;
 } gui_state_t;
 
-static void gui_output_append(gui_state_t *gs, const ring_slot_t *slot) {
-    int idx;
-    if (gs->output_count < OUTPUT_HISTORY_CAPACITY) {
-        idx = (gs->output_start + gs->output_count) % OUTPUT_HISTORY_CAPACITY;
-        gs->output_count++;
-    } else {
-        idx = gs->output_start;
-        gs->output_start = (gs->output_start + 1) % OUTPUT_HISTORY_CAPACITY;
+static void gui_output_append_line(gui_state_t *gs, const ring_slot_t *slot) {
+    int line_len = (int)strlen(slot->text);
+    int need = line_len + 1;
+
+    if (need >= OUTPUT_TEXT_CAPACITY)
+        return;
+    if (gs->output_text_len + need >= OUTPUT_TEXT_CAPACITY) {
+        int drop = OUTPUT_TEXT_CAPACITY / 4;
+        char *next = memchr(gs->output_text + drop, '\n',
+                            (size_t)(gs->output_text_len - drop));
+        if (next)
+            drop = (int)(next - gs->output_text) + 1;
+        if (drop > gs->output_text_len)
+            drop = gs->output_text_len;
+        memmove(gs->output_text, gs->output_text + drop,
+                (size_t)(gs->output_text_len - drop));
+        gs->output_text_len -= drop;
     }
-    gs->output[idx] = *slot;
+
+    memcpy(gs->output_text + gs->output_text_len, slot->text, (size_t)line_len);
+    gs->output_text_len += line_len;
+    gs->output_text[gs->output_text_len++] = '\n';
+    gs->output_text[gs->output_text_len] = '\0';
+    gs->output_edit_sync = 0;
+}
+
+static void gui_output_sync_edit(gui_state_t *gs) {
+    int cursor = gs->output_edit.cursor;
+    int sel_start = gs->output_edit.select_start;
+    int sel_end = gs->output_edit.select_end;
+    struct nk_vec2 scrollbar = gs->output_edit.scrollbar;
+    unsigned char active = gs->output_edit.active;
+
+    if (!gs->output_edit_ready) {
+        nk_textedit_init_default(&gs->output_edit);
+        gs->output_edit_ready = 1;
+    }
+    if (gs->output_edit_sync &&
+        nk_str_len_char(&gs->output_edit.string) == gs->output_text_len)
+        return;
+
+    nk_str_clear(&gs->output_edit.string);
+    nk_str_append_text_char(&gs->output_edit.string,
+                            gs->output_text, gs->output_text_len);
+    gs->output_edit.cursor = NK_CLAMP(0, cursor, gs->output_edit.string.len);
+    gs->output_edit.select_start = NK_CLAMP(0, sel_start, gs->output_edit.string.len);
+    gs->output_edit.select_end = NK_CLAMP(0, sel_end, gs->output_edit.string.len);
+    gs->output_edit.scrollbar = scrollbar;
+    gs->output_edit.active = active;
+    gs->output_edit.mode = NK_TEXT_EDIT_MODE_VIEW;
+    gs->output_edit_sync = 1;
+}
+
+static int gui_output_edit_matches(gui_state_t *gs) {
+    const char *text = nk_str_get_const(&gs->output_edit.string);
+    int len = nk_str_len_char(&gs->output_edit.string);
+    if (len != gs->output_text_len)
+        return 0;
+    if (len == 0)
+        return gs->output_text_len == 0;
+    return text && memcmp(text, gs->output_text, (size_t)len) == 0;
+}
+
+static void gui_output_copy_text(const char *text) {
+#ifdef _WIN32
+    if (text)
+        SDL_SetClipboardText(text);
+#else
+    if (text)
+        SDL_SetClipboardText(text);
+#endif
 }
 
 static int gui_output_drain(gui_state_t *gs) {
     int added = 0;
     ring_slot_t slot;
     while (ring_pop(&g_ring, &slot)) {
-        gui_output_append(gs, &slot);
+        gui_output_append_line(gs, &slot);
         added++;
     }
     return added;
 }
 
 static void gui_output_clear(gui_state_t *gs) {
-    gs->output_start = 0;
-    gs->output_count = 0;
+    gs->output_text_len = 0;
+    gs->output_text[0] = '\0';
+    gs->output_edit_sync = 0;
+    gs->packet_start = 0;
+    gs->packet_count = 0;
+}
+
+static void gui_packet_append(gui_state_t *gs, const output_packet_t *packet) {
+    int idx;
+    packet_lock_enter();
+    if (gs->packet_count < OUTPUT_PACKET_CAPACITY) {
+        idx = (gs->packet_start + gs->packet_count) % OUTPUT_PACKET_CAPACITY;
+        gs->packet_count++;
+    } else {
+        idx = gs->packet_start;
+        gs->packet_start = (gs->packet_start + 1) % OUTPUT_PACKET_CAPACITY;
+    }
+    gs->packets[idx] = *packet;
+    packet_lock_leave();
+}
+
+static void gui_packet_record(gui_state_t *gs, const char *label, int color,
+                              const unsigned char *data, unsigned len) {
+    output_packet_t packet;
+    int pos = 0;
+    int hh = 0, mm = 0, ss = 0, ms = 0;
+
+#ifdef _WIN32
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    hh = st.wHour; mm = st.wMinute; ss = st.wSecond; ms = st.wMilliseconds;
+#endif
+
+    memset(&packet, 0, sizeof(packet));
+    packet.len = len;
+    packet.color = color;
+    snprintf(packet.title, sizeof(packet.title),
+             "[%02d:%02d:%02d.%03d] %s  %u bytes", hh, mm, ss, ms, label, len);
+    for (unsigned i = 0; i < len && pos < (int)sizeof(packet.hex) - 4; i++)
+        pos += snprintf(packet.hex + pos, sizeof(packet.hex) - (size_t)pos,
+                        "%02X%s", data[i], (i + 1 < len) ? " " : "");
+
+    gui_packet_append(gs, &packet);
+}
+
+static int gui_packet_snapshot(gui_state_t *gs,
+                               output_packet_t *out, int max_count) {
+    int count;
+    packet_lock_enter();
+    count = gs->packet_count;
+    if (count > max_count)
+        count = max_count;
+    for (int n = 0; n < count; n++) {
+        int src = gs->packet_count - 1 - n;
+        int idx = (gs->packet_start + src) % OUTPUT_PACKET_CAPACITY;
+        out[n] = gs->packets[idx];
+    }
+    packet_lock_leave();
+    return count;
 }
 
 static int gui_port_exists(gui_state_t *gs, const char *port) {
@@ -466,6 +636,8 @@ typedef struct {
     const char  *color;
     Config      *cfg;
     int         *byte_count;
+    gui_state_t *gs;
+    int          gui_color;
 } fwd_args_gui_t;
 
 static THREAD_RET forward_thread_gui(THREAD_ARG param) {
@@ -483,6 +655,7 @@ static THREAD_RET forward_thread_gui(THREAD_ARG param) {
             continue;
         }
         *(a->byte_count) += (int)br;
+        gui_packet_record(a->gs, a->label, a->gui_color, buf, br);
         usp_log_data(a->cfg, a->label, a->color, buf, br);
         usp_serial_write(a->hDst, buf, br);
     }
@@ -499,6 +672,8 @@ static int                 win_w = 1100, win_h = 650;
 static struct nk_font     *default_font;
 
 static void nuklear_sdl_init(void) {
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
@@ -514,7 +689,18 @@ static void nuklear_sdl_init(void) {
     {
         struct nk_font_atlas *atlas;
         nk_sdl_font_stash_begin(&atlas);
-        default_font = nk_font_atlas_add_default(atlas, 14.0f, NULL);
+        {
+            struct nk_font_config cfg = nk_font_config(16.0f);
+            cfg.oversample_h = 2;
+            cfg.oversample_v = 2;
+            cfg.pixel_snap = 1;
+#ifdef _WIN32
+            default_font = nk_font_atlas_add_from_file(
+                atlas, "C:\\Windows\\Fonts\\consola.ttf", 16.0f, &cfg);
+#endif
+            if (!default_font)
+                default_font = nk_font_atlas_add_default(atlas, 15.0f, &cfg);
+        }
         nk_sdl_font_stash_end();
         if (default_font)
             nk_style_set_font(nk_ctx, &default_font->handle);
@@ -699,9 +885,11 @@ static void gui_panel_control(gui_state_t *gs) {
                 aAB.hSrc = gs->hIn;  aAB.hDst = gs->hOut;
                 aAB.label = labelAB; aAB.color = GREEN;
                 aAB.cfg  = &gs->cfg; aAB.byte_count = &gs->byte_count_in;
+                aAB.gs = gs;         aAB.gui_color = 3;
                 aBA.hSrc = gs->hOut; aBA.hDst = gs->hIn;
                 aBA.label = labelBA; aBA.color = CYAN;
                 aBA.cfg  = &gs->cfg; aBA.byte_count = &gs->byte_count_out;
+                aBA.gs = gs;         aBA.gui_color = 7;
 
                 thread_create(&gs->thread_ab, forward_thread_gui, &aAB);
                 thread_create(&gs->thread_ba, forward_thread_gui, &aBA);
@@ -760,23 +948,60 @@ static void gui_panel_control(gui_state_t *gs) {
 
 static void gui_panel_output(gui_state_t *gs) {
     int added = gui_output_drain(gs);
+    output_packet_t packet_view[OUTPUT_PACKET_CAPACITY];
+    int packet_count;
 
-    nk_layout_row_begin(nk_ctx, NK_STATIC, 24, 3);
+    gui_output_sync_edit(gs);
+
+    nk_layout_row_begin(nk_ctx, NK_STATIC, 24, 4);
     nk_layout_row_push(nk_ctx, 80);
     nk_label(nk_ctx, "Output", NK_TEXT_LEFT);
     nk_layout_row_push(nk_ctx, 120);
     nk_checkbox_label(nk_ctx, "Auto-scroll", &gs->auto_scroll_output);
+    nk_layout_row_push(nk_ctx, 88);
+    if (nk_button_label(nk_ctx, "Copy All"))
+        gui_output_copy_text(gs->output_text);
     nk_layout_row_push(nk_ctx, 80);
     if (nk_button_label(nk_ctx, "Bottom"))
         nk_group_set_scroll(nk_ctx, "output_panel", 0, 0x7fffffffU);
     nk_layout_row_end(nk_ctx);
 
-    for (int i = 0; i < gs->output_count; i++) {
-        int idx = (gs->output_start + i) % OUTPUT_HISTORY_CAPACITY;
-        ring_slot_t *slot = &gs->output[idx];
-        struct nk_color c = gui_colors[slot->color % 9];
+    nk_layout_row_dynamic(nk_ctx, 20, 1);
+    nk_label(nk_ctx, "Recent raw packets", NK_TEXT_LEFT);
+
+    packet_count = gui_packet_snapshot(gs, packet_view, OUTPUT_PACKET_CAPACITY);
+    for (int n = 0; n < packet_count; n++) {
+        output_packet_t packet = packet_view[n];
+        struct nk_color c = gui_colors[packet.color % 9];
+
+        nk_layout_row_begin(nk_ctx, NK_STATIC, 22, 3);
+        nk_layout_row_push(nk_ctx, 92);
+        if (nk_button_label(nk_ctx, "Copy HEX"))
+            gui_output_copy_text(packet.hex);
+        nk_layout_row_push(nk_ctx, 94);
+        if (nk_button_label(nk_ctx, "Copy Line")) {
+            char line[sizeof(packet.title) + sizeof(packet.hex) + 8];
+            snprintf(line, sizeof(line), "%s  %s", packet.title, packet.hex);
+            gui_output_copy_text(line);
+        }
+        nk_layout_row_push(nk_ctx, 520);
+        nk_label_colored(nk_ctx, packet.title, NK_TEXT_LEFT, c);
+        nk_layout_row_end(nk_ctx);
+
         nk_layout_row_dynamic(nk_ctx, 18, 1);
-        nk_label_colored(nk_ctx, slot->text, NK_TEXT_LEFT, c);
+        nk_label_colored(nk_ctx, packet.hex, NK_TEXT_LEFT, c);
+    }
+
+    nk_layout_row_dynamic(nk_ctx, 20, 1);
+    nk_label(nk_ctx, "Selectable log", NK_TEXT_LEFT);
+    nk_layout_row_dynamic(nk_ctx, 360, 1);
+    nk_edit_buffer(nk_ctx,
+                   NK_EDIT_EDITOR | NK_EDIT_NO_CURSOR | NK_EDIT_GOTO_END_ON_ACTIVATE,
+                   &gs->output_edit, nk_filter_default);
+
+    if (!gui_output_edit_matches(gs)) {
+        gs->output_edit_sync = 0;
+        gui_output_sync_edit(gs);
     }
 
     if (added && gs->auto_scroll_output)
@@ -797,6 +1022,7 @@ int main(int argc, char *argv[]) {
 
     usp_init();
     ring_init(&g_ring);
+    packet_lock_init();
     usp_set_output(gui_out_cb, gui_err_cb, &g_ring);
 
     static gui_state_t gs;
@@ -861,6 +1087,9 @@ int main(int argc, char *argv[]) {
         if (gs.cfg.logFile) fclose(gs.cfg.logFile);
     }
     nuklear_sdl_shutdown();
+    if (gs.output_edit_ready)
+        nk_textedit_free(&gs.output_edit);
+    packet_lock_destroy();
     usp_shutdown();
     return 0;
 }

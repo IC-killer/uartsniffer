@@ -92,6 +92,8 @@
 #define OUTPUT_TEXT_CAPACITY (256 * 1024)
 #define OUTPUT_PACKET_CAPACITY 128
 #define PACKET_HEX_CAPACITY (BUF_SIZE * 3 + 1)
+#define OUTPUT_PANEL_ID "output_panel"
+#define SELECTABLE_LOG_PANEL_ID "selectable_log_panel"
 
 typedef struct {
     char text[512];
@@ -443,6 +445,12 @@ static void gui_output_clear(gui_state_t *gs) {
     gs->output_edit_sync = 0;
     gs->packet_start = 0;
     gs->packet_count = 0;
+}
+
+static void gui_output_scroll_to_bottom(gui_state_t *gs) {
+    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
+    nk_group_set_scroll(nk_ctx, SELECTABLE_LOG_PANEL_ID, 0, 0x7fffffffU);
+    gs->output_edit.scrollbar.y = 1000000000.0f;
 }
 
 static void gui_packet_append(gui_state_t *gs, const output_packet_t *packet) {
@@ -947,30 +955,34 @@ static void gui_panel_control(gui_state_t *gs) {
 }
 
 static void gui_panel_output(gui_state_t *gs) {
-    int added = gui_output_drain(gs);
     output_packet_t packet_view[OUTPUT_PACKET_CAPACITY];
     int packet_count;
-
-    gui_output_sync_edit(gs);
 
     nk_layout_row_begin(nk_ctx, NK_STATIC, 24, 4);
     nk_layout_row_push(nk_ctx, 80);
     nk_label(nk_ctx, "Output", NK_TEXT_LEFT);
     nk_layout_row_push(nk_ctx, 120);
+    int was_auto_scroll = gs->auto_scroll_output;
     nk_checkbox_label(nk_ctx, "Auto-scroll", &gs->auto_scroll_output);
+    if (!was_auto_scroll && gs->auto_scroll_output)
+        gui_output_scroll_to_bottom(gs);
     nk_layout_row_push(nk_ctx, 88);
     if (nk_button_label(nk_ctx, "Copy All"))
         gui_output_copy_text(gs->output_text);
     nk_layout_row_push(nk_ctx, 80);
     if (nk_button_label(nk_ctx, "Bottom"))
-        nk_group_set_scroll(nk_ctx, "output_panel", 0, 0x7fffffffU);
+        gui_output_scroll_to_bottom(gs);
     nk_layout_row_end(nk_ctx);
 
     nk_layout_row_dynamic(nk_ctx, 20, 1);
     nk_label(nk_ctx, "Recent raw packets", NK_TEXT_LEFT);
 
     packet_count = gui_packet_snapshot(gs, packet_view, OUTPUT_PACKET_CAPACITY);
-    for (int n = 0; n < packet_count; n++) {
+    if (packet_count == 0) {
+        nk_layout_row_dynamic(nk_ctx, 22, 1);
+        nk_label_colored(nk_ctx, "(no packets yet)", NK_TEXT_LEFT, gui_colors[1]);
+    }
+    for (int n = packet_count - 1; n >= 0; n--) {
         output_packet_t packet = packet_view[n];
         struct nk_color c = gui_colors[packet.color % 9];
 
@@ -991,10 +1003,16 @@ static void gui_panel_output(gui_state_t *gs) {
         nk_layout_row_dynamic(nk_ctx, 18, 1);
         nk_label_colored(nk_ctx, packet.hex, NK_TEXT_LEFT, c);
     }
+}
+
+static void gui_panel_selectable_log(gui_state_t *gs, float panel_h) {
+    float edit_h = panel_h - 36.0f;
+    if (edit_h < 80.0f)
+        edit_h = 80.0f;
 
     nk_layout_row_dynamic(nk_ctx, 20, 1);
     nk_label(nk_ctx, "Selectable log", NK_TEXT_LEFT);
-    nk_layout_row_dynamic(nk_ctx, 360, 1);
+    nk_layout_row_dynamic(nk_ctx, edit_h, 1);
     nk_edit_buffer(nk_ctx,
                    NK_EDIT_EDITOR | NK_EDIT_NO_CURSOR | NK_EDIT_GOTO_END_ON_ACTIVATE,
                    &gs->output_edit, nk_filter_default);
@@ -1003,9 +1021,6 @@ static void gui_panel_output(gui_state_t *gs) {
         gs->output_edit_sync = 0;
         gui_output_sync_edit(gs);
     }
-
-    if (added && gs->auto_scroll_output)
-        nk_group_set_scroll(nk_ctx, "output_panel", 0, 0x7fffffffU);
 }
 
 /* ==========================================================================
@@ -1040,35 +1055,62 @@ int main(int argc, char *argv[]) {
                      nk_rect(0, 0, (float)win_w, (float)win_h),
                      NK_WINDOW_BORDER | NK_WINDOW_TITLE)) {
 
-            /* two columns: left panel (fixed) | right output (fill) */
             {
                 float left_w  = 340.0f;
                 float right_w = (float)win_w - left_w - 20.0f;
                 float panel_h = (float)win_h - 72.0f;
+                float gap_h = 8.0f;
+                float split_h;
+                float output_h;
+                float log_h;
+                int added;
                 if (right_w < 100.0f) right_w = 100.0f;
                 if (panel_h < 120.0f) panel_h = 120.0f;
-                nk_layout_row_begin(nk_ctx, NK_STATIC, panel_h, 2);
-                nk_layout_row_push(nk_ctx, left_w);
-                {
-                    if (nk_group_begin(nk_ctx, "left_panel",
-                                       NK_WINDOW_BORDER)) {
-                        gui_panel_serial(&gs);
-                        nk_layout_row_dynamic(nk_ctx, 6, 1);
-                        gui_panel_parser(&gs);
-                        nk_layout_row_dynamic(nk_ctx, 6, 1);
-                        gui_panel_control(&gs);
-                        nk_group_end(nk_ctx);
-                    }
+
+                split_h = panel_h - gap_h;
+                if (split_h < 80.0f) {
+                    gap_h = 0.0f;
+                    split_h = panel_h;
                 }
-                nk_layout_row_push(nk_ctx, right_w);
-                {
-                    if (nk_group_begin(nk_ctx, "output_panel",
-                                       NK_WINDOW_BORDER)) {
-                        gui_panel_output(&gs);
-                        nk_group_end(nk_ctx);
-                    }
+                output_h = split_h * 0.46f;
+                if (split_h >= 300.0f) {
+                    if (output_h < 140.0f) output_h = 140.0f;
+                    if (output_h > split_h - 120.0f)
+                        output_h = split_h - 120.0f;
                 }
-                nk_layout_row_end(nk_ctx);
+                log_h = split_h - output_h;
+
+                added = gui_output_drain(&gs);
+                gui_output_sync_edit(&gs);
+                if (added && gs.auto_scroll_output)
+                    gui_output_scroll_to_bottom(&gs);
+
+                nk_layout_space_begin(nk_ctx, NK_STATIC, panel_h, 3);
+                nk_layout_space_push(nk_ctx, nk_rect(0, 0, left_w, panel_h));
+                if (nk_group_begin(nk_ctx, "left_panel", NK_WINDOW_BORDER)) {
+                    gui_panel_serial(&gs);
+                    nk_layout_row_dynamic(nk_ctx, 6, 1);
+                    gui_panel_parser(&gs);
+                    nk_layout_row_dynamic(nk_ctx, 6, 1);
+                    gui_panel_control(&gs);
+                    nk_group_end(nk_ctx);
+                }
+
+                nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f, 0,
+                                                     right_w, output_h));
+                if (nk_group_begin(nk_ctx, OUTPUT_PANEL_ID, NK_WINDOW_BORDER)) {
+                    gui_panel_output(&gs);
+                    nk_group_end(nk_ctx);
+                }
+
+                nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f, output_h + gap_h,
+                                                     right_w, log_h));
+                if (nk_group_begin(nk_ctx, SELECTABLE_LOG_PANEL_ID,
+                                   NK_WINDOW_BORDER)) {
+                    gui_panel_selectable_log(&gs, log_h);
+                    nk_group_end(nk_ctx);
+                }
+                nk_layout_space_end(nk_ctx);
             }
         }
         nk_end(nk_ctx);

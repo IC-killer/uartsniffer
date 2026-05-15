@@ -5,3 +5,4 @@ m.cfg
 compile_commands.json
 *.o
 .cache/
+.deepseek/

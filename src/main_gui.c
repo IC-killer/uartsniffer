@@ -416,6 +416,37 @@ static void gui_output_sync_edit(gui_state_t *gs) {
     gs->output_edit_sync = 1;
 }
 
+static int gui_output_line_count(const gui_state_t *gs) {
+    int lines = 1;
+    for (int i = 0; i < gs->output_text_len; i++) {
+        if (gs->output_text[i] == '\n')
+            lines++;
+    }
+    return lines;
+}
+
+static void gui_output_edit_scroll_to_bottom(gui_state_t *gs, float edit_h) {
+    const struct nk_style_edit *style = &nk_ctx->style.edit;
+    const struct nk_user_font *font = nk_ctx->style.font;
+    float row_height;
+    float visible_h;
+    float text_h;
+    float bottom_y;
+
+    if (!font)
+        return;
+
+    row_height = font->height + style->row_padding;
+    visible_h = edit_h - (2.0f * style->padding.y + 2.0f * style->border);
+    if (visible_h < row_height)
+        visible_h = row_height;
+
+    text_h = (float)gui_output_line_count(gs) * row_height;
+    bottom_y = text_h > visible_h ? text_h - visible_h : 0.0f;
+    gs->output_edit.scrollbar.x = 0.0f;
+    gs->output_edit.scrollbar.y = bottom_y;
+}
+
 static int gui_output_edit_matches(gui_state_t *gs) {
     const char *text = nk_str_get_const(&gs->output_edit.string);
     int len = nk_str_len(&gs->output_edit.string);
@@ -490,7 +521,6 @@ static void gui_apply_buffer_size(gui_state_t *gs, unsigned size) {
 static void gui_output_scroll_to_bottom(gui_state_t *gs) {
     nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
     nk_group_set_scroll(nk_ctx, SELECTABLE_LOG_PANEL_ID, 0, 0x7fffffffU);
-    gs->output_edit.scrollbar.y = 1000000000.0f;
     gs->output_scroll_pending = 1;
 }
 
@@ -1202,6 +1232,8 @@ static void gui_panel_selectable_log(gui_state_t *gs, float panel_h) {
         gs->output_edit_sync = 0;
         gui_output_sync_edit(gs);
     }
+    if (gs->output_scroll_pending)
+        gui_output_edit_scroll_to_bottom(gs, edit_h);
     nk_layout_row_dynamic(nk_ctx, edit_h, 1);
     nk_edit_buffer(nk_ctx,
                    NK_EDIT_EDITOR | NK_EDIT_NO_CURSOR,
@@ -1319,7 +1351,6 @@ int main(int argc, char *argv[]) {
                 if (scroll_after_layout || gs.output_scroll_pending) {
                     nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
                     nk_group_set_scroll(nk_ctx, SELECTABLE_LOG_PANEL_ID, 0, 0x7fffffffU);
-                    gs.output_edit.scrollbar.y = 1000000000.0f;
                     gs.output_scroll_pending = 0;
                 }
             }

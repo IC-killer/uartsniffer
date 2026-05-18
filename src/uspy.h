@@ -22,7 +22,10 @@ extern "C" {
 #endif
 
 /* ── limits ──────────────────────────────────────────────────────────────── */
-#define BUF_SIZE        1024
+#define USP_DEFAULT_BUFFER_SIZE 4096U
+#define USP_MIN_BUFFER_SIZE     256U
+#define USP_MAX_BUFFER_SIZE     65536U
+#define BUF_SIZE        USP_DEFAULT_BUFFER_SIZE
 #define MAX_PORT_LEN    32
 #define LOG_FILE        "sniff.log"
 #define COLS_PER_ROW    16
@@ -103,6 +106,7 @@ typedef struct {
     char   cfgFile[256];
     int    useParser;
     int    big_endian;
+    unsigned buffer_size;
     FILE  *logFile;
 } Config;
 
@@ -184,13 +188,20 @@ int  usp_serial_list(char **buf, int max);
 
 /* Open a serial port.  port is a platform-native name ("COM6", "/dev/ttyUSB0").
    Returns NULL on failure. */
+usp_serial_t usp_serial_open_ex(const char *port, int baud, unsigned buffer_size);
 usp_serial_t usp_serial_open(const char *port, int baud);
+
+/* Clamp user input to a usable serial bridge buffer size. */
+unsigned usp_normalize_buffer_size(unsigned size);
 
 /* Read up to `len` bytes. Returns bytes actually read, or 0 on error/timeout. */
 unsigned usp_serial_read(usp_serial_t h, unsigned char *buf, unsigned len);
 
 /* Write up to `len` bytes. Returns bytes actually written. */
 unsigned usp_serial_write(usp_serial_t h, const unsigned char *buf, unsigned len);
+
+/* Apply the platform serial-driver queue size where supported. */
+void usp_serial_set_buffer_size(usp_serial_t h, unsigned buffer_size);
 
 /* Close the port. */
 void usp_serial_close(usp_serial_t h);

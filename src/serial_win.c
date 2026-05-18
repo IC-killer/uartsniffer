@@ -106,14 +106,17 @@ static void make_port_path(const char *name, char *out, int outsz) {
         snprintf(out, outsz, "\\\\.\\%s", name);
 }
 
-usp_serial_t usp_serial_open(const char *port, int baud) {
+usp_serial_t usp_serial_open_ex(const char *port, int baud, unsigned buffer_size) {
     char path[MAX_PORT_LEN + 8];
+    unsigned queue_size = usp_normalize_buffer_size(buffer_size);
     make_port_path(port, path, sizeof(path));
 
     HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
                            0, NULL, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return NULL;
+
+    SetupComm(h, (DWORD)queue_size, (DWORD)queue_size);
 
     DCB dcb = {0};
     dcb.DCBlength = sizeof(dcb);
@@ -128,6 +131,10 @@ usp_serial_t usp_serial_open(const char *port, int baud) {
     SetCommTimeouts(h, &to);
 
     return (usp_serial_t)h;
+}
+
+usp_serial_t usp_serial_open(const char *port, int baud) {
+    return usp_serial_open_ex(port, baud, USP_DEFAULT_BUFFER_SIZE);
 }
 
 void usp_serial_close(usp_serial_t h) {
@@ -146,4 +153,10 @@ unsigned usp_serial_write(usp_serial_t h, const unsigned char *buf, unsigned len
     DWORD bw = 0;
     if (!WriteFile((HANDLE)h, buf, (DWORD)len, &bw, NULL)) return 0;
     return (unsigned)bw;
+}
+
+void usp_serial_set_buffer_size(usp_serial_t h, unsigned buffer_size) {
+    unsigned queue_size = usp_normalize_buffer_size(buffer_size);
+    if (h)
+        SetupComm((HANDLE)h, (DWORD)queue_size, (DWORD)queue_size);
 }

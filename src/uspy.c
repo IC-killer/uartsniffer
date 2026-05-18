@@ -64,6 +64,16 @@ static usp_output_fn g_out_fn = NULL;
 static usp_output_fn g_err_fn = NULL;
 static void         *g_out_ctx = NULL;
 
+unsigned usp_normalize_buffer_size(unsigned size) {
+    if (size == 0)
+        return USP_DEFAULT_BUFFER_SIZE;
+    if (size < USP_MIN_BUFFER_SIZE)
+        return USP_MIN_BUFFER_SIZE;
+    if (size > USP_MAX_BUFFER_SIZE)
+        return USP_MAX_BUFFER_SIZE;
+    return size;
+}
+
 /* ==========================================================================
    Output abstraction
    ========================================================================== */

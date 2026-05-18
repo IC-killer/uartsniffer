@@ -91,7 +91,8 @@
 #define GUI_MAX_PORTS 64
 #define OUTPUT_TEXT_CAPACITY (256 * 1024)
 #define OUTPUT_PACKET_CAPACITY 128
-#define PACKET_HEX_CAPACITY (BUF_SIZE * 3 + 1)
+#define PACKET_HEX_CAPACITY (USP_MAX_BUFFER_SIZE * 3 + 32)
+#define PACKET_HEX_PREVIEW_CHARS (BUF_SIZE * 3)
 #define OUTPUT_TOOLBAR_ID "output_toolbar"
 #define OUTPUT_PANEL_ID "output_panel"
 #define SELECTABLE_LOG_PANEL_ID "selectable_log_panel"
@@ -117,6 +118,7 @@ typedef struct {
     char hex[PACKET_HEX_CAPACITY];
     unsigned len;
     int color;
+    int truncated;
 } output_packet_t;
 
 static ring_t g_ring;
@@ -322,6 +324,7 @@ typedef struct {
     int   baud;
     int   baud_text_len;
     char  baud_text[16];
+    unsigned buffer_size;
 
     /* parser */
     int   big_endian;
@@ -343,6 +346,7 @@ typedef struct {
     struct nk_text_edit output_edit;
     int   output_edit_ready;
     int   output_edit_sync;
+    int   output_scroll_pending;
     output_packet_t packets[OUTPUT_PACKET_CAPACITY];
     int   packet_start;
     int   packet_count;
@@ -392,10 +396,12 @@ static void gui_output_sync_edit(gui_state_t *gs) {
 
     if (!gs->output_edit_ready) {
         nk_textedit_init_default(&gs->output_edit);
+        nk_textedit_clear_state(&gs->output_edit, NK_TEXT_EDIT_MULTI_LINE,
+                                nk_filter_default);
         gs->output_edit_ready = 1;
     }
     if (gs->output_edit_sync &&
-        nk_str_len_char(&gs->output_edit.string) == gs->output_text_len)
+        nk_str_len(&gs->output_edit.string) == gs->output_text_len)
         return;
 
     nk_str_clear(&gs->output_edit.string);
@@ -412,7 +418,7 @@ static void gui_output_sync_edit(gui_state_t *gs) {
 
 static int gui_output_edit_matches(gui_state_t *gs) {
     const char *text = nk_str_get_const(&gs->output_edit.string);
-    int len = nk_str_len_char(&gs->output_edit.string);
+    int len = nk_str_len(&gs->output_edit.string);
     if (len != gs->output_text_len)
         return 0;
     if (len == 0)
@@ -448,15 +454,48 @@ static void gui_output_clear(gui_state_t *gs) {
     gs->packet_count = 0;
 }
 
+static unsigned gui_effective_buffer_size(const gui_state_t *gs) {
+    return usp_normalize_buffer_size(gs->buffer_size);
+}
+
+static void gui_format_buffer_size(unsigned size, char *out, size_t out_size) {
+    size = usp_normalize_buffer_size(size);
+    if (size >= 1024 && (size % 1024) == 0)
+        snprintf(out, out_size, "%u KB", size / 1024);
+    else
+        snprintf(out, out_size, "%u bytes", size);
+}
+
+static void gui_apply_buffer_size(gui_state_t *gs, unsigned size) {
+    char label[32];
+    unsigned normalized = usp_normalize_buffer_size(size);
+    if (gs->buffer_size == normalized)
+        return;
+
+    gs->buffer_size = normalized;
+    gs->cfg.buffer_size = normalized;
+    if (gs->hIn)
+        usp_serial_set_buffer_size(gs->hIn, normalized);
+    if (gs->hOut)
+        usp_serial_set_buffer_size(gs->hOut, normalized);
+
+    gui_format_buffer_size(normalized, label, sizeof(label));
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Buffer size: %s\n", label);
+        ring_push(&g_ring, msg, 5);
+    }
+}
+
 static void gui_output_scroll_to_bottom(gui_state_t *gs) {
     nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
     nk_group_set_scroll(nk_ctx, SELECTABLE_LOG_PANEL_ID, 0, 0x7fffffffU);
     gs->output_edit.scrollbar.y = 1000000000.0f;
+    gs->output_scroll_pending = 1;
 }
 
-static void gui_packet_append(gui_state_t *gs, const output_packet_t *packet) {
+static output_packet_t *gui_packet_reserve(gui_state_t *gs) {
     int idx;
-    packet_lock_enter();
     if (gs->packet_count < OUTPUT_PACKET_CAPACITY) {
         idx = (gs->packet_start + gs->packet_count) % OUTPUT_PACKET_CAPACITY;
         gs->packet_count++;
@@ -464,14 +503,34 @@ static void gui_packet_append(gui_state_t *gs, const output_packet_t *packet) {
         idx = gs->packet_start;
         gs->packet_start = (gs->packet_start + 1) % OUTPUT_PACKET_CAPACITY;
     }
-    gs->packets[idx] = *packet;
+    memset(&gs->packets[idx], 0, sizeof(gs->packets[idx]));
+    return &gs->packets[idx];
+}
+
+static void gui_packet_append(gui_state_t *gs, const char *label, int color,
+                              const unsigned char *data, unsigned len,
+                              int hh, int mm, int ss, int ms) {
+    output_packet_t *packet;
+    int pos = 0;
+    packet_lock_enter();
+    packet = gui_packet_reserve(gs);
+    packet->len = len;
+    packet->color = color;
+    packet->truncated = 0;
+    snprintf(packet->title, sizeof(packet->title),
+             "[%02d:%02d:%02d.%03d] %s  %u bytes", hh, mm, ss, ms, label, len);
+    for (unsigned i = 0; i < len && pos < (int)sizeof(packet->hex) - 8; i++)
+        pos += snprintf(packet->hex + pos, sizeof(packet->hex) - (size_t)pos,
+                        "%02X%s", data[i], (i + 1 < len) ? " " : "");
+    if (pos >= (int)sizeof(packet->hex) - 8) {
+        packet->truncated = 1;
+        snprintf(packet->hex + pos, sizeof(packet->hex) - (size_t)pos, " ...");
+    }
     packet_lock_leave();
 }
 
 static void gui_packet_record(gui_state_t *gs, const char *label, int color,
                               const unsigned char *data, unsigned len) {
-    output_packet_t packet;
-    int pos = 0;
     int hh = 0, mm = 0, ss = 0, ms = 0;
 
 #ifdef _WIN32
@@ -480,16 +539,7 @@ static void gui_packet_record(gui_state_t *gs, const char *label, int color,
     hh = st.wHour; mm = st.wMinute; ss = st.wSecond; ms = st.wMilliseconds;
 #endif
 
-    memset(&packet, 0, sizeof(packet));
-    packet.len = len;
-    packet.color = color;
-    snprintf(packet.title, sizeof(packet.title),
-             "[%02d:%02d:%02d.%03d] %s  %u bytes", hh, mm, ss, ms, label, len);
-    for (unsigned i = 0; i < len && pos < (int)sizeof(packet.hex) - 4; i++)
-        pos += snprintf(packet.hex + pos, sizeof(packet.hex) - (size_t)pos,
-                        "%02X%s", data[i], (i + 1 < len) ? " " : "");
-
-    gui_packet_append(gs, &packet);
+    gui_packet_append(gs, label, color, data, len, hh, mm, ss, ms);
 }
 
 static int gui_packet_snapshot(gui_state_t *gs,
@@ -561,6 +611,27 @@ static void gui_port_dropdown(gui_state_t *gs, char *target, size_t target_size,
                     snprintf(target, target_size, "%s", gs->ports[i]);
                     nk_combo_close(nk_ctx);
                 }
+            }
+        }
+        nk_combo_end(nk_ctx);
+    }
+}
+
+static void gui_buffer_dropdown(gui_state_t *gs) {
+    static const unsigned presets[] = {
+        1024U, 2048U, 4096U, 8192U, 16384U, 32768U, 65536U
+    };
+    char current[32];
+    gui_format_buffer_size(gui_effective_buffer_size(gs), current, sizeof(current));
+
+    if (nk_combo_begin_label(nk_ctx, current, nk_vec2(160, 190))) {
+        nk_layout_row_dynamic(nk_ctx, 20, 1);
+        for (int i = 0; i < (int)(sizeof(presets) / sizeof(presets[0])); i++) {
+            char label[32];
+            gui_format_buffer_size(presets[i], label, sizeof(label));
+            if (nk_combo_item_label(nk_ctx, label, NK_TEXT_LEFT)) {
+                gui_apply_buffer_size(gs, presets[i]);
+                nk_combo_close(nk_ctx);
             }
         }
         nk_combo_end(nk_ctx);
@@ -651,10 +722,29 @@ typedef struct {
 
 static THREAD_RET forward_thread_gui(THREAD_ARG param) {
     fwd_args_gui_t *a = (fwd_args_gui_t *)param;
-    unsigned char buf[BUF_SIZE];
+    unsigned allocated = gui_effective_buffer_size(a->gs);
+    unsigned char *buf = (unsigned char *)malloc(allocated);
+    if (!buf) {
+        usp_err(RED "[ERR] Cannot allocate bridge buffer (%u bytes)\n" R,
+                allocated);
+        usp_quit();
+        return 0;
+    }
 
     while (!usp_should_quit()) {
-        unsigned br = usp_serial_read(a->hSrc, buf, BUF_SIZE);
+        unsigned buf_size = gui_effective_buffer_size(a->gs);
+        if (buf_size > allocated) {
+            unsigned char *new_buf = (unsigned char *)realloc(buf, buf_size);
+            if (!new_buf) {
+                usp_err(RED "[ERR] Cannot resize bridge buffer (%u bytes)\n" R,
+                        buf_size);
+                usp_quit();
+                break;
+            }
+            buf = new_buf;
+            allocated = buf_size;
+        }
+        unsigned br = usp_serial_read(a->hSrc, buf, buf_size);
         if (br == 0) {
 #ifdef _WIN32
             Sleep(1);
@@ -668,6 +758,7 @@ static THREAD_RET forward_thread_gui(THREAD_ARG param) {
         usp_log_data(a->cfg, a->label, a->color, buf, br);
         usp_serial_write(a->hDst, buf, br);
     }
+    free(buf);
     return 0;
 }
 
@@ -765,7 +856,8 @@ static void nuklear_sdl_new_frame(void) {
     nk_input_begin(nk_ctx);
     SDL_Event evt;
     while (SDL_PollEvent(&evt)) {
-        if (evt.type == SDL_QUIT) usp_quit();
+        if (evt.type == SDL_QUIT)
+            usp_quit();
         nk_sdl_handle_event(&evt);
         if (evt.type == SDL_WINDOWEVENT &&
             evt.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
@@ -843,6 +935,10 @@ static void gui_panel_serial(gui_state_t *gs) {
         }
         nk_combo_end(nk_ctx);
     }
+
+    nk_layout_row_dynamic(nk_ctx, 22, 2);
+    nk_label(nk_ctx, "Buffer:", NK_TEXT_LEFT);
+    gui_buffer_dropdown(gs);
 }
 
 static void gui_panel_parser(gui_state_t *gs) {
@@ -887,9 +983,10 @@ static void gui_panel_control(gui_state_t *gs) {
             /* parse baud */
             gs->baud = atoi(gs->baud_text);
             if (gs->baud <= 0) gs->baud = 9600;
+            gs->buffer_size = gui_effective_buffer_size(gs);
 
-            gs->hIn  = usp_serial_open(gs->portIn,  gs->baud);
-            gs->hOut = usp_serial_open(gs->portOut, gs->baud);
+            gs->hIn  = usp_serial_open_ex(gs->portIn,  gs->baud, gs->buffer_size);
+            gs->hOut = usp_serial_open_ex(gs->portOut, gs->baud, gs->buffer_size);
 
             if (!gs->hIn || !gs->hOut) {
                 ring_push(&g_ring, "Cannot open serial port(s)!\n", 2);
@@ -903,6 +1000,7 @@ static void gui_panel_control(gui_state_t *gs) {
                 snprintf(gs->cfg.portOut, MAX_PORT_LEN, "%s", gs->portOut);
                 gs->cfg.baud       = gs->baud;
                 gs->cfg.big_endian = gs->big_endian;
+                gs->cfg.buffer_size = gs->buffer_size;
                 snprintf(gs->cfg.cfgFile, sizeof(gs->cfg.cfgFile), "%s", gs->cfg_path);
                 gs->cfg.logFile = fopen(LOG_FILE, "a");
 
@@ -1011,8 +1109,50 @@ static void gui_output_toolbar(gui_state_t *gs) {
     nk_layout_row_end(nk_ctx);
 }
 
+static void gui_label_hex_wrapped(const char *hex, struct nk_color color) {
+    struct nk_vec2 region = nk_window_get_content_region_size(nk_ctx);
+    int chars_per_line = (int)(region.x / 9.0f);
+    const char *p = hex;
+    int shown = 0;
+    if (chars_per_line < 24)
+        chars_per_line = 24;
+    chars_per_line -= chars_per_line % 3;
+    if (chars_per_line > 96)
+        chars_per_line = 96;
+
+    while (*p && shown < PACKET_HEX_PREVIEW_CHARS) {
+        char line[112];
+        int take = 0;
+        int remain = PACKET_HEX_PREVIEW_CHARS - shown;
+        int limit = chars_per_line < remain ? chars_per_line : remain;
+        while (p[take] && p[take] != '\n' && take < limit)
+            take++;
+        while (take > 3 && p[take] && p[take] != ' ')
+            take--;
+        if (take <= 0)
+            take = (int)strlen(p);
+        if (take > (int)sizeof(line) - 1)
+            take = (int)sizeof(line) - 1;
+        memcpy(line, p, (size_t)take);
+        line[take] = '\0';
+
+        nk_layout_row_dynamic(nk_ctx, 18, 1);
+        nk_label_colored(nk_ctx, line, NK_TEXT_LEFT, color);
+
+        p += take;
+        shown += take;
+        while (*p == ' ')
+            p++;
+    }
+
+    if (*p) {
+        nk_layout_row_dynamic(nk_ctx, 18, 1);
+        nk_label_colored(nk_ctx, "...", NK_TEXT_LEFT, color);
+    }
+}
+
 static void gui_panel_output(gui_state_t *gs) {
-    output_packet_t packet_view[OUTPUT_PACKET_CAPACITY];
+    static output_packet_t packet_view[OUTPUT_PACKET_CAPACITY];
     int packet_count;
 
     nk_layout_row_dynamic(nk_ctx, 20, 1);
@@ -1024,25 +1164,30 @@ static void gui_panel_output(gui_state_t *gs) {
         nk_label_colored(nk_ctx, "(no packets yet)", NK_TEXT_LEFT, gui_colors[1]);
     }
     for (int n = packet_count - 1; n >= 0; n--) {
-        output_packet_t packet = packet_view[n];
-        struct nk_color c = gui_colors[packet.color % 9];
+        const output_packet_t *packet = &packet_view[n];
+        struct nk_color c = gui_colors[packet->color % 9];
 
         nk_layout_row_begin(nk_ctx, NK_STATIC, 22, 3);
         nk_layout_row_push(nk_ctx, 92);
         if (nk_button_label(nk_ctx, "Copy HEX"))
-            gui_output_copy_text(packet.hex);
+            gui_output_copy_text(packet->hex);
         nk_layout_row_push(nk_ctx, 94);
         if (nk_button_label(nk_ctx, "Copy Line")) {
-            char line[sizeof(packet.title) + sizeof(packet.hex) + 8];
-            snprintf(line, sizeof(line), "%s  %s", packet.title, packet.hex);
-            gui_output_copy_text(line);
+            size_t title_len = strlen(packet->title);
+            size_t hex_len = strlen(packet->hex);
+            char *line = (char *)malloc(title_len + hex_len + 4);
+            if (line) {
+                snprintf(line, title_len + hex_len + 4,
+                         "%s  %s", packet->title, packet->hex);
+                gui_output_copy_text(line);
+                free(line);
+            }
         }
         nk_layout_row_push(nk_ctx, 520);
-        nk_label_colored(nk_ctx, packet.title, NK_TEXT_LEFT, c);
+        nk_label_colored(nk_ctx, packet->title, NK_TEXT_LEFT, c);
         nk_layout_row_end(nk_ctx);
 
-        nk_layout_row_dynamic(nk_ctx, 18, 1);
-        nk_label_colored(nk_ctx, packet.hex, NK_TEXT_LEFT, c);
+        gui_label_hex_wrapped(packet->hex, c);
     }
 }
 
@@ -1053,15 +1198,15 @@ static void gui_panel_selectable_log(gui_state_t *gs, float panel_h) {
 
     nk_layout_row_dynamic(nk_ctx, 20, 1);
     nk_label(nk_ctx, "Selectable log", NK_TEXT_LEFT);
-    nk_layout_row_dynamic(nk_ctx, edit_h, 1);
-    nk_edit_buffer(nk_ctx,
-                   NK_EDIT_EDITOR | NK_EDIT_NO_CURSOR | NK_EDIT_GOTO_END_ON_ACTIVATE,
-                   &gs->output_edit, nk_filter_default);
-
     if (!gui_output_edit_matches(gs)) {
         gs->output_edit_sync = 0;
         gui_output_sync_edit(gs);
     }
+    nk_layout_row_dynamic(nk_ctx, edit_h, 1);
+    nk_edit_buffer(nk_ctx,
+                   NK_EDIT_EDITOR | NK_EDIT_NO_CURSOR,
+                   &gs->output_edit, nk_filter_default);
+    gs->output_edit.mode = NK_TEXT_EDIT_MODE_VIEW;
 }
 
 /* ==========================================================================
@@ -1085,6 +1230,7 @@ int main(int argc, char *argv[]) {
     memset(&gs, 0, sizeof(gs));
     strcpy(gs.baud_text, "9600");
     gs.baud = 9600;
+    gs.buffer_size = USP_DEFAULT_BUFFER_SIZE;
     gs.auto_scroll_output = 1;
 
     nuklear_sdl_init();
@@ -1106,6 +1252,7 @@ int main(int argc, char *argv[]) {
                 float output_h;
                 float log_h;
                 int added;
+                int scroll_after_layout = 0;
                 if (right_w < 420.0f) right_w = 420.0f;
                 if (panel_h < 120.0f) panel_h = 120.0f;
 
@@ -1128,8 +1275,10 @@ int main(int argc, char *argv[]) {
 
                 added = gui_output_drain(&gs);
                 gui_output_sync_edit(&gs);
-                if (added && gs.auto_scroll_output)
+                if (added && gs.auto_scroll_output) {
                     gui_output_scroll_to_bottom(&gs);
+                    scroll_after_layout = 1;
+                }
 
                 nk_layout_space_begin(nk_ctx, NK_STATIC, panel_h, 4);
                 nk_layout_space_push(nk_ctx, nk_rect(0, 0, left_w, panel_h));
@@ -1166,6 +1315,13 @@ int main(int argc, char *argv[]) {
                     nk_group_end(nk_ctx);
                 }
                 nk_layout_space_end(nk_ctx);
+
+                if (scroll_after_layout || gs.output_scroll_pending) {
+                    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
+                    nk_group_set_scroll(nk_ctx, SELECTABLE_LOG_PANEL_ID, 0, 0x7fffffffU);
+                    gs.output_edit.scrollbar.y = 1000000000.0f;
+                    gs.output_scroll_pending = 0;
+                }
             }
         }
         nk_end(nk_ctx);

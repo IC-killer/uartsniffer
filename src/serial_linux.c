@@ -70,7 +70,8 @@ int usp_serial_list(char **buf, int max) {
 
 /* ── open / close ────────────────────────────────────────────────────────── */
 
-usp_serial_t usp_serial_open(const char *port, int baud) {
+usp_serial_t usp_serial_open_ex(const char *port, int baud, unsigned buffer_size) {
+    (void)buffer_size;
     int fd = open(port, O_RDWR | O_NOCTTY | O_NDELAY);
     if (fd < 0) return NULL;
 
@@ -116,6 +117,10 @@ usp_serial_t usp_serial_open(const char *port, int baud) {
     return (usp_serial_t)(intptr_t)fd;
 }
 
+usp_serial_t usp_serial_open(const char *port, int baud) {
+    return usp_serial_open_ex(port, baud, USP_DEFAULT_BUFFER_SIZE);
+}
+
 void usp_serial_close(usp_serial_t h) {
     if (h) close((int)(intptr_t)h);
 }
@@ -137,6 +142,11 @@ unsigned usp_serial_write(usp_serial_t h, const unsigned char *buf, unsigned len
     ssize_t n = write(fd, buf, len);
     if (n < 0) return 0;
     return (unsigned)n;
+}
+
+void usp_serial_set_buffer_size(usp_serial_t h, unsigned buffer_size) {
+    (void)h;
+    (void)buffer_size;
 }
 
 #endif /* !_WIN32 */

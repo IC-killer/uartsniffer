@@ -56,6 +56,8 @@ static void print_banner(const Config *cfg, const RuleSet *rs) {
     P("|  " GRAY "Log  %-*s" R "|\n", BW - 8, LOG_FILE);
     P("|  " GRAY "End  %-*s" R "|\n", BW - 8,
       cfg->big_endian ? "big-endian" : "little-endian (default)");
+    P("|  " GRAY "Buf  %-10u bytes%-*s" R "|\n",
+      cfg->buffer_size, BW - 24, "");
     if (cfg->cfgFile[0])
         P("|  " MAG "CFG  %-*s" R "|\n", BW - 8, cfg->cfgFile);
     else
@@ -78,11 +80,13 @@ static void print_banner(const Config *cfg, const RuleSet *rs) {
 static void print_usage(const char *exe) {
     fprintf(stderr,
             BOLD "Usage:\n" R
-            "  %s -i <IN> -o <OUT> [-b <BAUD>] [-lemode|-bemode] [-c <CFG>]\n\n"
+            "  %s -i <IN> -o <OUT> [-b <BAUD>] [-B <BYTES>] [-lemode|-bemode] [-c <CFG>]\n\n"
             "Options:\n"
             "  -i <port>    Input  port  (e.g. COM6, /dev/ttyUSB0)\n"
             "  -o <port>    Output port\n"
             "  -b <baud>    Baud rate    (default: 9600)\n"
+            "  -B <bytes>   Bridge read/driver buffer size (default: %u, range: %u..%u)\n"
+            "  --buffer-size <bytes>\n"
             "  -lemode      Little-endian parse (default)\n"
             "  -bemode      Big-endian parse\n"
             "  -c <file>    Protocol config file (auto-reloaded on save)\n\n"
@@ -91,8 +95,9 @@ static void print_usage(const char *exe) {
             "  Alt+X   quit           (Windows only)\n"
             "  Ctrl+C  quit           (all platforms)\n\n"
             "Example:\n"
-            "  %s -i COM6 -o COM7 -b 115200 -bemode -c sniff.cfg\n",
-            exe, exe);
+            "  %s -i COM6 -o COM7 -b 115200 -B 8192 -bemode -c sniff.cfg\n",
+            exe, USP_DEFAULT_BUFFER_SIZE, USP_MIN_BUFFER_SIZE,
+            USP_MAX_BUFFER_SIZE, exe);
 }
 
 /* ==========================================================================
@@ -141,10 +146,30 @@ static void *forward_thread(void *param)
 #endif
 {
     fwd_args_t *a = (fwd_args_t *)param;
-    unsigned char buf[BUF_SIZE];
+    unsigned allocated = usp_normalize_buffer_size(a->cfg->buffer_size);
+    unsigned buf_size = allocated;
+    unsigned char *buf = (unsigned char *)malloc(allocated);
+    if (!buf) {
+        usp_err(RED "[ERR] Cannot allocate bridge buffer (%u bytes)\n" R,
+                allocated);
+        usp_quit();
+        return 0;
+    }
 
     while (!usp_should_quit()) {
-        unsigned br = usp_serial_read(a->hSrc, buf, BUF_SIZE);
+        buf_size = usp_normalize_buffer_size(a->cfg->buffer_size);
+        if (buf_size > allocated) {
+            unsigned char *new_buf = (unsigned char *)realloc(buf, buf_size);
+            if (!new_buf) {
+                usp_err(RED "[ERR] Cannot resize bridge buffer (%u bytes)\n" R,
+                        buf_size);
+                usp_quit();
+                break;
+            }
+            buf = new_buf;
+            allocated = buf_size;
+        }
+        unsigned br = usp_serial_read(a->hSrc, buf, buf_size);
         if (br == 0) {
 #ifdef _WIN32
             Sleep(1);
@@ -156,6 +181,7 @@ static void *forward_thread(void *param)
         usp_log_data(a->cfg, a->label, a->color, buf, br);
         usp_serial_write(a->hDst, buf, br);
     }
+    free(buf);
     return 0;
 }
 
@@ -234,10 +260,17 @@ int main(int argc, char *argv[]) {
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.baud = 9600;
+    cfg.buffer_size = USP_DEFAULT_BUFFER_SIZE;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-b") && i + 1 < argc)
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (!strcmp(argv[i], "-b") && i + 1 < argc)
             cfg.baud = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "-B") || !strcmp(argv[i], "--buffer-size")) &&
+                 i + 1 < argc)
+            cfg.buffer_size = usp_normalize_buffer_size((unsigned)strtoul(argv[++i], NULL, 0));
         else if (!strcmp(argv[i], "-i") && i + 1 < argc)
             snprintf(cfg.portIn, MAX_PORT_LEN, "%s", argv[++i]);
         else if (!strcmp(argv[i], "-o") && i + 1 < argc)
@@ -292,8 +325,9 @@ int main(int argc, char *argv[]) {
     cfg.logFile = logFile;
 
     /* ── open serial ports ────────────────────────────────────────────── */
-    usp_serial_t hIn  = usp_serial_open(cfg.portIn,  cfg.baud);
-    usp_serial_t hOut = usp_serial_open(cfg.portOut, cfg.baud);
+    cfg.buffer_size = usp_normalize_buffer_size(cfg.buffer_size);
+    usp_serial_t hIn  = usp_serial_open_ex(cfg.portIn,  cfg.baud, cfg.buffer_size);
+    usp_serial_t hOut = usp_serial_open_ex(cfg.portOut, cfg.baud, cfg.buffer_size);
 
     if (!hIn) {
         usp_err(RED "[ERR] Cannot open input  port %s\n" R, cfg.portIn);

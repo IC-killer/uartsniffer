@@ -2,8 +2,10 @@ uartsniffer.exe
 uartsniffer-gui.exe
 sniff.log
 m.cfg
+test.cfg
 compile_commands.json
 *.o
 .cache/
 .deepseek/
+.claude/
 cfgs/pyx.cfg

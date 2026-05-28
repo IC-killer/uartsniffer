@@ -114,9 +114,12 @@ static void on_cfg_changed(void *ctx, const char *path) {
                  path, n);
         usp_out("%s", buf);
         if (n > 0) {
-            RuleSet snap;
-            usp_ruleset_snapshot(&snap);
-            usp_print_ruleset(&snap, cfg->big_endian);
+            RuleSet *snap = (RuleSet *)malloc(sizeof(RuleSet));
+            if (snap) {
+                usp_ruleset_snapshot(snap);
+                usp_print_ruleset(snap, cfg->big_endian);
+                free(snap);
+            }
         }
         usp_out("\n");
     } else {
@@ -308,14 +311,20 @@ int main(int argc, char *argv[]) {
 #endif
 
     /* ── load config ───────────────────────────────────────────────────── */
-    RuleSet initial_rs = {0};
+    /* RuleSet is too large for the stack on Windows; allocate on heap. */
+    RuleSet *initial_rs = (RuleSet *)calloc(1, sizeof(RuleSet));
+    if (!initial_rs) {
+        usp_err(RED "[ERR] Out of memory\n" R);
+        return 1;
+    }
     if (cfg.cfgFile[0]) {
-        int n = load_config_into(cfg.cfgFile, &initial_rs);
+        int n = load_config_into(cfg.cfgFile, initial_rs);
         if (n < 0) {
             usp_err(RED "[ERR] Cannot open config: %s\n" R, cfg.cfgFile);
+            free(initial_rs);
             return 1;
         }
-        usp_ruleset_replace(&initial_rs);
+        usp_ruleset_replace(initial_rs);
         usp_set_parser((n > 0) ? 1 : 0);
     }
 
@@ -342,7 +351,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── banner ───────────────────────────────────────────────────────── */
-    print_banner(&cfg, &initial_rs);
+    print_banner(&cfg, initial_rs);
 
     /* ── signal handler (Linux) ───────────────────────────────────────── */
 #ifndef _WIN32
@@ -387,6 +396,7 @@ int main(int argc, char *argv[]) {
     usp_serial_close(hIn);
     usp_serial_close(hOut);
     if (logFile) fclose(logFile);
+    free(initial_rs);
     usp_shutdown();
     return 0;
 }

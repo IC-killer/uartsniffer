@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make cli *)",
+      "Bash(make gui *)",
+      "Bash(make clean *)",
+      "Bash(make all *)",
+      "Bash(./uartsniffer.exe --help)"
+    ]
+  }
+}

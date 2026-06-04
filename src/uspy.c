@@ -126,11 +126,14 @@ void usp_ruleset_replace(const RuleSet *src) {
 
 /* convenience: load config file into global ruleset */
 int usp_ruleset_load(const char *path) {
-    RuleSet tmp;
-    int n = load_config_into(path, &tmp);
-    if (n < 0) return -1;
-    usp_ruleset_replace(&tmp);
+    /* RuleSet is too large to live on the stack on Windows (~2 MB > default 1 MB) */
+    RuleSet *tmp = (RuleSet *)malloc(sizeof(RuleSet));
+    if (!tmp) return -1;
+    int n = load_config_into(path, tmp);
+    if (n < 0) { free(tmp); return -1; }
+    usp_ruleset_replace(tmp);
     usp_atomic_store(&g_useParser, (n > 0) ? 1 : 0);
+    free(tmp);
     return n;
 }
 
@@ -166,26 +169,58 @@ static void print_ruleset_locked(const RuleSet *rs, int big_endian) {
                             YEL "\"%s\"" R "  ", r->rule_label);
         for (int f = 0; f < r->filter_count; f++) {
             const Filter *fl = &r->filters[f];
-            if (fl->type == FT_LEN)
+            switch (fl->type) {
+            case FT_LEN:
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                CYAN "{len=%d}" R " ", fl->value);
-            else
+                                CYAN "{len=%d}" R " ", fl->value); break;
+            case FT_MINLEN:
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                CYAN "{idx%d=0x%02X}" R " ", fl->idx, fl->value);
+                                CYAN "{minlen=%d}" R " ", fl->value); break;
+            case FT_MAXLEN:
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                                CYAN "{maxlen=%d}" R " ", fl->value); break;
+            case FT_LAST:
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                                CYAN "{last=0x%02X}" R " ", fl->value); break;
+            case FT_IDX:
+            default:
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                                CYAN "{idx%d=0x%02X}" R " ", fl->idx, fl->value); break;
+            }
         }
         for (int f = 0; f < r->field_count; f++) {
             const Field *fld = &r->fields[f];
             char tag[MAX_LABEL_LEN + 16];
-            if (fld->type == DT_ARRAY)
-                snprintf(tag, sizeof(tag), "array-%d", fld->array_size);
-            else
-                snprintf(tag, sizeof(tag), "%s", dtype_name(fld));
+            switch (fld->type) {
+            case DT_ARRAY:  snprintf(tag, sizeof(tag), "array-%d", fld->array_size); break;
+            case DT_STRING: snprintf(tag, sizeof(tag), "str-%d",   fld->array_size); break;
+            case DT_BCD:    snprintf(tag, sizeof(tag), "bcd-%d",   fld->array_size); break;
+            default:        snprintf(tag, sizeof(tag), "%s",       dtype_name(fld)); break;
+            }
             if (fld->label[0])
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                GREEN "[%s:%s]" R " ", tag, fld->label);
+                                GREEN "[%s:%s" R, tag, fld->label);
             else
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                GREEN "[%s]" R " ", tag);
+                                GREEN "[%s" R, tag);
+
+            /* modifiers */
+            if (fld->scale != 1.0)
+                pos += snprintf(buf + pos, sizeof(buf) - pos, GRAY "@%g" R, fld->scale);
+            if (fld->offset != 0.0) {
+                if (fld->offset > 0)
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, GRAY "+%g" R, fld->offset);
+                else
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, GRAY "%g" R, fld->offset);
+            }
+            if (fld->unit[0])
+                pos += snprintf(buf + pos, sizeof(buf) - pos, GRAY "=%s" R, fld->unit);
+            if (fld->fmt)
+                pos += snprintf(buf + pos, sizeof(buf) - pos, GRAY "%%%c" R, fld->fmt);
+            if (fld->enum_count)
+                pos += snprintf(buf + pos, sizeof(buf) - pos, GRAY "|%dx" R, fld->enum_count);
+
+            pos += snprintf(buf + pos, sizeof(buf) - pos, GREEN "]" R " ");
         }
         pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
         usp_out("%s", buf);
@@ -193,6 +228,86 @@ static void print_ruleset_locked(const RuleSet *rs, int big_endian) {
 }
 
 /* ── single field value printer ─────────────────────────────────────────── */
+
+/* Format an integer in binary, max 64 bits. Caller supplies buf. */
+static void format_binary(char *buf, size_t bufsz, unsigned long long v, int bits) {
+    if (bufsz < (size_t)(bits + 3)) { buf[0] = '\0'; return; }
+    size_t pos = 0;
+    buf[pos++] = '0'; buf[pos++] = 'b';
+    for (int i = bits - 1; i >= 0 && pos + 1 < bufsz; i--)
+        buf[pos++] = ((v >> i) & 1) ? '1' : '0';
+    buf[pos] = '\0';
+}
+
+/* Look up enum name for the given raw integer; returns NULL if no match. */
+static const char *enum_lookup(const Field *fld, long long raw) {
+    for (int i = 0; i < fld->enum_count; i++)
+        if (fld->enums[i].value == (long)raw) return fld->enums[i].name;
+    return NULL;
+}
+
+/* Append " -> scaled [unit]" and " (enum)" to valbuf if applicable. */
+static void append_transforms(char *valbuf, size_t bufsz,
+                              const Field *fld, double raw_d, long long raw_i,
+                              int is_integer) {
+    size_t cur = strlen(valbuf);
+    if (cur >= bufsz) return;
+
+    int has_scale = (fld->scale != 1.0 || fld->offset != 0.0);
+    if (has_scale) {
+        double scaled = raw_d * fld->scale + fld->offset;
+        cur += snprintf(valbuf + cur, bufsz - cur, "  -> %g", scaled);
+        if (cur < bufsz && fld->unit[0])
+            cur += snprintf(valbuf + cur, bufsz - cur, " %s", fld->unit);
+    } else if (fld->unit[0]) {
+        cur += snprintf(valbuf + cur, bufsz - cur, " %s", fld->unit);
+    }
+
+    if (cur < bufsz && is_integer && fld->enum_count) {
+        const char *nm = enum_lookup(fld, raw_i);
+        if (nm) snprintf(valbuf + cur, bufsz - cur, "  (%s)", nm);
+    }
+}
+
+/* Format the base (raw) numeric value into valbuf, honoring fld->fmt. */
+static void format_integer(char *valbuf, size_t bufsz,
+                           long long sval, unsigned long long uval,
+                           int is_signed, int width_bits, char fmt) {
+    int width_hex = width_bits / 4;
+    switch (fmt) {
+    case 'x':
+        snprintf(valbuf, bufsz, "0x%0*llX", width_hex, uval); break;
+    case 'd':
+        if (is_signed) snprintf(valbuf, bufsz, "%lld", sval);
+        else           snprintf(valbuf, bufsz, "%llu", uval);
+        break;
+    case 'o':
+        snprintf(valbuf, bufsz, "0%llo", uval); break;
+    case 'b': {
+        char bin[80];
+        format_binary(bin, sizeof(bin), uval, width_bits);
+        snprintf(valbuf, bufsz, "%s", bin);
+        break;
+    }
+    case 'c':
+        if (uval >= 0x20 && uval < 0x7F)
+            snprintf(valbuf, bufsz, "'%c'  (0x%02llX)", (char)uval, uval);
+        else
+            snprintf(valbuf, bufsz, "0x%02llX", uval);
+        break;
+    default:
+        if (is_signed) {
+            if (width_bits <= 8)       snprintf(valbuf, bufsz, "%4lld", sval);
+            else if (width_bits <= 16) snprintf(valbuf, bufsz, "%6lld", sval);
+            else                       snprintf(valbuf, bufsz, "%11lld", sval);
+        } else {
+            if (width_bits <= 8)       snprintf(valbuf, bufsz, "%3llu  (0x%02llX)", uval, uval);
+            else if (width_bits <= 16) snprintf(valbuf, bufsz, "%5llu  (0x%04llX)", uval, uval);
+            else                       snprintf(valbuf, bufsz, "%10llu  (0x%08llX)", uval, uval);
+        }
+        break;
+    }
+}
 
 static void print_field_value(const Field *fld, const unsigned char *data,
                               unsigned avail, unsigned *consumed,
@@ -212,87 +327,91 @@ static void print_field_value(const Field *fld, const unsigned char *data,
         return;
     }
 
-    /* label */
+    /* label cell (padded to 16 chars; long labels overflow gracefully) */
     char lbl[MAX_LABEL_LEN + 4];
     snprintf(lbl, sizeof(lbl), "%-16s",
              fld->label[0] ? fld->label : dtype_name(fld));
 
-    /* hex summary */
+    /* hex summary cell */
     char hexbuf[72] = {0};
-    if (fld->type == DT_ARRAY) {
+    {
         int show = sz > 8 ? 8 : sz, pos = 0;
         for (int i = 0; i < show; i++)
             pos += snprintf(hexbuf + pos, sizeof(hexbuf) - pos,
                             "%02X ", data[i]);
         if (sz > 8)
             snprintf(hexbuf + pos, sizeof(hexbuf) - pos, "...");
-    } else {
-        for (int i = 0; i < sz; i++)
-            snprintf(hexbuf + i * 3, sizeof(hexbuf) - i * 3,
-                     "%02X ", data[i]);
     }
 
-    /* decoded value */
-    char valbuf[160] = {0};
+    /* decoded value cell */
+    char valbuf[256] = {0};
     int be = usp_parser_use_be(fld, cfg_be);
+
     switch (fld->type) {
     case DT_U8:
-        snprintf(valbuf, sizeof(valbuf), "%3u  (0x%02X)", data[0], data[0]);
+        format_integer(valbuf, sizeof(valbuf), data[0], data[0], 0, 8, fld->fmt);
+        append_transforms(valbuf, sizeof(valbuf), fld,
+                          (double)data[0], (long long)data[0], 1);
         break;
-    case DT_S8:
-        snprintf(valbuf, sizeof(valbuf), "%4d", (signed char)data[0]);
+    case DT_S8: {
+        signed char s = (signed char)data[0];
+        format_integer(valbuf, sizeof(valbuf), s, (unsigned char)s, 1, 8, fld->fmt);
+        append_transforms(valbuf, sizeof(valbuf), fld,
+                          (double)s, (long long)s, 1);
         break;
+    }
     case DT_U16: {
         unsigned short v;
         if (be) usp_parser_read_u16be(data, &v);
         else    usp_parser_read_u16le(data, &v);
-        snprintf(valbuf, sizeof(valbuf), "%5u  (0x%04X)", v, v);
+        format_integer(valbuf, sizeof(valbuf), v, v, 0, 16, fld->fmt);
+        append_transforms(valbuf, sizeof(valbuf), fld, (double)v, (long long)v, 1);
         break;
     }
     case DT_S16: {
         unsigned short raw;
         if (be) usp_parser_read_u16be(data, &raw);
         else    usp_parser_read_u16le(data, &raw);
-        snprintf(valbuf, sizeof(valbuf), "%6d", (short)raw);
+        short s = (short)raw;
+        format_integer(valbuf, sizeof(valbuf), s, raw, 1, 16, fld->fmt);
+        append_transforms(valbuf, sizeof(valbuf), fld, (double)s, (long long)s, 1);
         break;
     }
     case DT_U32: {
         unsigned raw;
         if (be) usp_parser_read_u32be(data, &raw);
         else    usp_parser_read_u32le(data, &raw);
-        snprintf(valbuf, sizeof(valbuf), "%10u  (0x%08X)", raw, raw);
+        format_integer(valbuf, sizeof(valbuf), raw, raw, 0, 32, fld->fmt);
+        append_transforms(valbuf, sizeof(valbuf), fld, (double)raw, (long long)raw, 1);
         break;
     }
     case DT_S32: {
         unsigned raw;
         if (be) usp_parser_read_u32be(data, &raw);
         else    usp_parser_read_u32le(data, &raw);
-        snprintf(valbuf, sizeof(valbuf), "%11d", (int)raw);
+        int s = (int)raw;
+        format_integer(valbuf, sizeof(valbuf), s, raw, 1, 32, fld->fmt);
+        append_transforms(valbuf, sizeof(valbuf), fld, (double)s, (long long)s, 1);
         break;
     }
     case DT_FLOAT: {
         unsigned char fb[4];
-        if (be) {
-            fb[0] = data[3]; fb[1] = data[2];
-            fb[2] = data[1]; fb[3] = data[0];
-        } else {
-            memcpy(fb, data, 4);
-        }
+        if (be) { fb[0] = data[3]; fb[1] = data[2]; fb[2] = data[1]; fb[3] = data[0]; }
+        else    { memcpy(fb, data, 4); }
         float fv;
         memcpy(&fv, fb, 4);
         snprintf(valbuf, sizeof(valbuf), "%g", fv);
+        append_transforms(valbuf, sizeof(valbuf), fld, (double)fv, 0, 0);
         break;
     }
     case DT_DOUBLE: {
         unsigned char db[8];
-        if (be) {
-            for (int i = 0; i < 8; i++) db[i] = data[7 - i];
-        } else {
-            memcpy(db, data, 8);
-        }
+        if (be) { for (int i = 0; i < 8; i++) db[i] = data[7 - i]; }
+        else    { memcpy(db, data, 8); }
         double dv;
         memcpy(&dv, db, 8);
         snprintf(valbuf, sizeof(valbuf), "%g", dv);
+        append_transforms(valbuf, sizeof(valbuf), fld, dv, 0, 0);
         break;
     }
     case DT_ARRAY: {
@@ -301,11 +420,47 @@ static void print_field_value(const Field *fld, const unsigned char *data,
         for (int i = 0; i < sz && pos < (int)sizeof(valbuf) - 4; i++)
             pos += snprintf(valbuf + pos, sizeof(valbuf) - pos,
                             "%02X ", data[i]);
+        if (fld->unit[0])
+            snprintf(valbuf + pos, sizeof(valbuf) - pos, " %s", fld->unit);
+        break;
+    }
+    case DT_STRING: {
+        int pos = 0;
+        if (pos < (int)sizeof(valbuf) - 2) valbuf[pos++] = '"';
+        for (int i = 0; i < sz && pos < (int)sizeof(valbuf) - 4; i++) {
+            unsigned char c = data[i];
+            if (c == 0) break;                 /* stop at embedded NUL */
+            if (c >= 0x20 && c < 0x7F) valbuf[pos++] = (char)c;
+            else                       valbuf[pos++] = '.';
+        }
+        if (pos < (int)sizeof(valbuf) - 1) valbuf[pos++] = '"';
+        valbuf[pos] = '\0';
+        if (fld->unit[0])
+            snprintf(valbuf + pos, sizeof(valbuf) - pos, " %s", fld->unit);
+        break;
+    }
+    case DT_BCD: {
+        /* each byte = 2 BCD digits (high nibble first) */
+        int pos = 0;
+        for (int i = 0; i < sz && pos < (int)sizeof(valbuf) - 4; i++) {
+            unsigned hi = (data[i] >> 4) & 0xF;
+            unsigned lo =  data[i]       & 0xF;
+            if (hi > 9 || lo > 9) {
+                snprintf(valbuf, sizeof(valbuf), "<invalid BCD>");
+                pos = (int)strlen(valbuf);
+                break;
+            }
+            valbuf[pos++] = (char)('0' + hi);
+            valbuf[pos++] = (char)('0' + lo);
+        }
+        valbuf[pos] = '\0';
+        if (fld->unit[0])
+            snprintf(valbuf + pos, sizeof(valbuf) - pos, " %s", fld->unit);
         break;
     }
     }
 
-    char outbuf[512];
+    char outbuf[768];
     snprintf(outbuf, sizeof(outbuf),
              "  " BOX_V "  " GRAY "[%04X]" R "  " BLUE "%-16s" R "  " GRAY
              "%-24s" R "  " WHT "%s" R "\n",
@@ -323,12 +478,15 @@ static void print_field_value(const Field *fld, const unsigned char *data,
 
 int usp_try_parse(Config *cfg, const unsigned char *data, unsigned len,
                   const char *dir) {
-    RuleSet snap;
-    usp_ruleset_snapshot(&snap);
+    /* RuleSet is too large for the stack; allocate on heap. */
+    RuleSet *snap = (RuleSet *)malloc(sizeof(RuleSet));
+    if (!snap) return 0;
+    usp_ruleset_snapshot(snap);
 
     const int W = 62;
-    for (int r = 0; r < snap.count; r++) {
-        const Rule *rule = &snap.rules[r];
+    int matched = 0;
+    for (int r = 0; r < snap->count; r++) {
+        const Rule *rule = &snap->rules[r];
         if (!rule_matches(rule, data, len)) continue;
 
         char hdr[MAX_LINE_LEN];
@@ -398,9 +556,11 @@ int usp_try_parse(Config *cfg, const unsigned char *data, unsigned len,
                     "--------------------------------------------------------------");
             fflush(cfg->logFile);
         }
-        return 1;
+        matched = 1;
+        break;
     }
-    return 0;
+    free(snap);
+    return matched;
 }
 
 /* ==========================================================================

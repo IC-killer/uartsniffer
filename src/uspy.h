@@ -29,11 +29,14 @@ extern "C" {
 #define MAX_PORT_LEN    32
 #define LOG_FILE        "sniff.log"
 #define COLS_PER_ROW    16
-#define MAX_RULES       64
-#define MAX_FILTERS     16
-#define MAX_FIELDS      64
-#define MAX_LABEL_LEN   64
-#define MAX_LINE_LEN    512
+#define MAX_RULES        64
+#define MAX_FILTERS      16
+#define MAX_FIELDS       64
+#define MAX_LABEL_LEN    64
+#define MAX_LINE_LEN     512
+#define MAX_UNIT_LEN     12
+#define MAX_ENUM_NAME    24
+#define MAX_ENUM_ENTRIES 16
 
 /* ── ANSI ────────────────────────────────────────────────────────────────── */
 
@@ -63,7 +66,13 @@ extern "C" {
 /* ==========================================================================
    Data structures
    ========================================================================== */
-typedef enum { FT_LEN, FT_IDX } FilterType;
+typedef enum {
+    FT_LEN,      /* exact length */
+    FT_IDX,      /* data[idx] == value */
+    FT_MINLEN,   /* len >= value */
+    FT_MAXLEN,   /* len <= value */
+    FT_LAST,     /* data[len-1] == value */
+} FilterType;
 typedef struct {
     FilterType type;
     int        idx;
@@ -74,15 +83,34 @@ typedef enum {
     DT_U8, DT_S8, DT_U16, DT_S16,
     DT_U32, DT_S32, DT_FLOAT, DT_DOUBLE,
     DT_ARRAY,
+    DT_STRING,   /* printable ASCII, N bytes */
+    DT_BCD,      /* BCD-encoded decimal, N bytes (each byte = 2 digits) */
 } DataType;
 
 typedef enum { EO_GLOBAL = 0, EO_LE, EO_BE } EndianOverride;
 
 typedef struct {
+    long value;
+    char name[MAX_ENUM_NAME];
+} EnumEntry;
+
+typedef struct {
     DataType        type;
-    int             array_size;
+    int             array_size;       /* for DT_ARRAY / DT_STRING / DT_BCD */
     EndianOverride  endian;
     char            label[MAX_LABEL_LEN];
+
+    /* display modifiers (numeric types only, except `unit` which applies to all) */
+    double          scale;            /* multiply raw value (default 1.0) */
+    double          offset;           /* add after scale       (default 0.0) */
+    char            unit[MAX_UNIT_LEN];  /* unit string e.g. "V", "°C"     */
+    char            fmt;              /* display format: 'x' hex, 'd' dec,
+                                                            'b' binary,
+                                                            'o' octal,
+                                                            'c' char,
+                                                            0 = default      */
+    EnumEntry       enums[MAX_ENUM_ENTRIES];
+    int             enum_count;
 } Field;
 
 typedef struct {

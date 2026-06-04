@@ -352,6 +352,14 @@ typedef struct {
     int   packet_count;
     int   auto_scroll_output;
 
+    /* selectable-log rule filter */
+    int   filter_rule_enabled;          /* checkbox: only show selected rule */
+    char  filter_rule_text[16];         /* number input (decimal only) */
+    int   filter_rule_index;            /* parsed rule index, 1-based; <=0 = none */
+    char  filtered_text[OUTPUT_TEXT_CAPACITY];
+    int   filtered_text_len;
+    int   filtered_dirty;               /* filtered_text needs rebuild */
+
     /* handles */
     usp_serial_t   hIn;
     usp_serial_t   hOut;
@@ -360,6 +368,114 @@ typedef struct {
     thread_t       thread_ba;
     Config         cfg;
 } gui_state_t;
+
+/* First non-space character of a line range, or 0 if the line is blank. */
+static int gui_line_first_char(const char *text, int start, int end) {
+    int p = start;
+    while (p < end && text[p] == ' ')
+        p++;
+    return (p < end) ? (unsigned char)text[p] : 0;
+}
+
+/* Parse the rule index out of a parser-box header line ("Rule #N ..."),
+   or return -1 if this line is not such a header. */
+static int gui_line_rule_number(const char *text, int start, int end) {
+    for (int k = start; k + 6 <= end; k++) {
+        if (memcmp(text + k, "Rule #", 6) == 0) {
+            int num = 0, q = k + 6, got = 0;
+            while (q < end && text[q] >= '0' && text[q] <= '9') {
+                num = num * 10 + (text[q] - '0');
+                q++;
+                got = 1;
+            }
+            return got ? num : -1;
+        }
+    }
+    return -1;
+}
+
+/* Rebuild filtered_text to contain only the parser boxes whose header is
+   "Rule #<filter_rule_index>". A box is a maximal run of consecutive lines
+   that start (after leading spaces) with '+' (border) or '|' (content). */
+static void gui_output_rebuild_filtered(gui_state_t *gs) {
+    const char *text = gs->output_text;
+    int len = gs->output_text_len;
+    int i = 0;
+
+    gs->filtered_text_len = 0;
+    gs->filtered_text[0] = '\0';
+    gs->filtered_dirty = 0;
+
+    if (!gs->filter_rule_enabled || gs->filter_rule_index <= 0)
+        return;
+
+    while (i < len) {
+        int line_start = i;
+        int line_end;
+        int fc;
+
+        while (i < len && text[i] != '\n')
+            i++;
+        line_end = i;
+        if (i < len)
+            i++;
+
+        fc = gui_line_first_char(text, line_start, line_end);
+        if (fc != '+' && fc != '|')
+            continue;   /* not part of a parser box */
+
+        /* Extend the box run and capture its rule number. */
+        {
+            int run_start = line_start;
+            int run_end = line_end < len ? line_end + 1 : line_end;
+            int rule_num = gui_line_rule_number(text, line_start, line_end);
+
+            while (i < len) {
+                int ls = i;
+                int le;
+                int c;
+
+                while (i < len && text[i] != '\n')
+                    i++;
+                le = i;
+
+                c = gui_line_first_char(text, ls, le);
+                if (c != '+' && c != '|') {
+                    i = ls;     /* hand this line back to the outer loop */
+                    break;
+                }
+                if (i < len)
+                    i++;
+                run_end = i;
+                if (rule_num < 0)
+                    rule_num = gui_line_rule_number(text, ls, le);
+            }
+
+            if (rule_num == gs->filter_rule_index) {
+                int n = run_end - run_start;
+                if (gs->filtered_text_len + n < OUTPUT_TEXT_CAPACITY - 1) {
+                    memcpy(gs->filtered_text + gs->filtered_text_len,
+                           text + run_start, (size_t)n);
+                    gs->filtered_text_len += n;
+                }
+            }
+        }
+    }
+
+    gs->filtered_text[gs->filtered_text_len] = '\0';
+}
+
+/* The text currently shown in the selectable log: filtered or full. */
+static const char *gui_display_text(gui_state_t *gs, int *len_out) {
+    if (gs->filter_rule_enabled) {
+        if (gs->filtered_dirty)
+            gui_output_rebuild_filtered(gs);
+        *len_out = gs->filtered_text_len;
+        return gs->filtered_text;
+    }
+    *len_out = gs->output_text_len;
+    return gs->output_text;
+}
 
 static void gui_output_append_line(gui_state_t *gs, const ring_slot_t *slot) {
     int line_len = (int)strlen(slot->text);
@@ -385,6 +501,7 @@ static void gui_output_append_line(gui_state_t *gs, const ring_slot_t *slot) {
     gs->output_text[gs->output_text_len++] = '\n';
     gs->output_text[gs->output_text_len] = '\0';
     gs->output_edit_sync = 0;
+    gs->filtered_dirty = 1;
 }
 
 static void gui_output_sync_edit(gui_state_t *gs) {
@@ -400,13 +517,17 @@ static void gui_output_sync_edit(gui_state_t *gs) {
                                 nk_filter_default);
         gs->output_edit_ready = 1;
     }
+    {
+    int disp_len = 0;
+    const char *disp = gui_display_text(gs, &disp_len);
+
     if (gs->output_edit_sync &&
-        nk_str_len(&gs->output_edit.string) == gs->output_text_len)
+        nk_str_len(&gs->output_edit.string) == disp_len)
         return;
 
     nk_str_clear(&gs->output_edit.string);
-    nk_str_append_text_char(&gs->output_edit.string,
-                            gs->output_text, gs->output_text_len);
+    nk_str_append_text_char(&gs->output_edit.string, disp, disp_len);
+    }
     gs->output_edit.cursor = NK_CLAMP(0, cursor, gs->output_edit.string.len);
     gs->output_edit.select_start = NK_CLAMP(0, sel_start, gs->output_edit.string.len);
     gs->output_edit.select_end = NK_CLAMP(0, sel_end, gs->output_edit.string.len);
@@ -416,10 +537,12 @@ static void gui_output_sync_edit(gui_state_t *gs) {
     gs->output_edit_sync = 1;
 }
 
-static int gui_output_line_count(const gui_state_t *gs) {
+static int gui_output_line_count(gui_state_t *gs) {
+    int disp_len = 0;
+    const char *disp = gui_display_text(gs, &disp_len);
     int lines = 1;
-    for (int i = 0; i < gs->output_text_len; i++) {
-        if (gs->output_text[i] == '\n')
+    for (int i = 0; i < disp_len; i++) {
+        if (disp[i] == '\n')
             lines++;
     }
     return lines;
@@ -450,11 +573,13 @@ static void gui_output_edit_scroll_to_bottom(gui_state_t *gs, float edit_h) {
 static int gui_output_edit_matches(gui_state_t *gs) {
     const char *text = nk_str_get_const(&gs->output_edit.string);
     int len = nk_str_len(&gs->output_edit.string);
-    if (len != gs->output_text_len)
+    int disp_len = 0;
+    const char *disp = gui_display_text(gs, &disp_len);
+    if (len != disp_len)
         return 0;
     if (len == 0)
-        return gs->output_text_len == 0;
-    return text && memcmp(text, gs->output_text, (size_t)len) == 0;
+        return disp_len == 0;
+    return text && memcmp(text, disp, (size_t)len) == 0;
 }
 
 static void gui_output_copy_text(const char *text) {
@@ -481,6 +606,9 @@ static void gui_output_clear(gui_state_t *gs) {
     gs->output_text_len = 0;
     gs->output_text[0] = '\0';
     gs->output_edit_sync = 0;
+    gs->filtered_text_len = 0;
+    gs->filtered_text[0] = '\0';
+    gs->filtered_dirty = 1;
     gs->packet_start = 0;
     gs->packet_count = 0;
 }
@@ -851,6 +979,7 @@ static void nuklear_sdl_init(void) {
                            win_w, win_h,
                            SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     gl_ctx = SDL_GL_CreateContext(win);
+    SDL_GL_SetSwapInterval(1);   /* vsync: throttle redraws, stop tearing/flicker */
 
     nk_ctx = nk_sdl_init(win);
     {
@@ -901,8 +1030,8 @@ static void nuklear_sdl_new_frame(void) {
 static void nuklear_sdl_render(void) {
     SDL_GL_MakeCurrent(win, gl_ctx);
     glViewport(0, 0, win_w, win_h);
-    glClear(GL_COLOR_BUFFER_BIT);
     glClearColor(0.12f, 0.12f, 0.14f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     nk_sdl_render(NK_ANTI_ALIASING_ON);
     SDL_GL_SwapWindow(win);
 }
@@ -1222,12 +1351,39 @@ static void gui_panel_output(gui_state_t *gs) {
 }
 
 static void gui_panel_selectable_log(gui_state_t *gs, float panel_h) {
-    float edit_h = panel_h - 36.0f;
+    float edit_h = panel_h - 44.0f;
     if (edit_h < 80.0f)
         edit_h = 80.0f;
 
-    nk_layout_row_dynamic(nk_ctx, 20, 1);
-    nk_label(nk_ctx, "Selectable log", NK_TEXT_LEFT);
+    {
+        int prev_enabled = gs->filter_rule_enabled;
+        char prev_text[sizeof(gs->filter_rule_text)];
+        memcpy(prev_text, gs->filter_rule_text, sizeof(prev_text));
+
+        nk_layout_row_begin(nk_ctx, NK_STATIC, 30, 4);
+        nk_layout_row_push(nk_ctx, 150);
+        nk_label(nk_ctx, "Selectable log", NK_TEXT_LEFT);
+        nk_layout_row_push(nk_ctx, 30);
+        nk_spacing(nk_ctx, 1);
+        nk_layout_row_push(nk_ctx, 150);
+        nk_checkbox_label(nk_ctx, "Only show rule #", &gs->filter_rule_enabled);
+        nk_layout_row_push(nk_ctx, 70);
+        nk_edit_string_zero_terminated(nk_ctx, NK_EDIT_SIMPLE,
+                                       gs->filter_rule_text,
+                                       sizeof(gs->filter_rule_text),
+                                       nk_filter_decimal);
+        nk_layout_row_end(nk_ctx);
+
+        if (gs->filter_rule_enabled != prev_enabled ||
+            strcmp(prev_text, gs->filter_rule_text) != 0) {
+            gs->filter_rule_index = atoi(gs->filter_rule_text);
+            gs->filtered_dirty = 1;
+            gs->output_edit_sync = 0;
+            if (gs->filter_rule_enabled)
+                gui_output_scroll_to_bottom(gs);
+        }
+    }
+
     if (!gui_output_edit_matches(gs)) {
         gs->output_edit_sync = 0;
         gui_output_sync_edit(gs);
@@ -1268,6 +1424,8 @@ int main(int argc, char *argv[]) {
     nuklear_sdl_init();
 
     while (!usp_should_quit()) {
+        Uint64 frame_start = SDL_GetTicks64();
+
         nuklear_sdl_new_frame();
 
         if (nk_begin(nk_ctx, "UartSniffer",
@@ -1358,6 +1516,14 @@ int main(int argc, char *argv[]) {
         nk_end(nk_ctx);
 
         nuklear_sdl_render();
+
+        /* Cap to ~60 FPS even when the GL driver ignores vsync, so the
+           double buffer is not swapped thousands of times per second. */
+        {
+            Uint64 elapsed = SDL_GetTicks64() - frame_start;
+            if (elapsed < 16)
+                SDL_Delay((Uint32)(16 - elapsed));
+        }
     }
 
     /* cleanup */

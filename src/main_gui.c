@@ -347,6 +347,7 @@ typedef struct {
     int   output_edit_ready;
     int   output_edit_sync;
     int   output_scroll_pending;
+    int   output_raw_scroll_pending;
     output_packet_t packets[OUTPUT_PACKET_CAPACITY];
     int   packet_start;
     int   packet_count;
@@ -477,9 +478,51 @@ static const char *gui_display_text(gui_state_t *gs, int *len_out) {
     return gs->output_text;
 }
 
+static void gui_output_edit_restore_state(gui_state_t *gs,
+                                          int cursor, int sel_start,
+                                          int sel_end,
+                                          struct nk_vec2 scrollbar,
+                                          unsigned char active) {
+    gs->output_edit.cursor = NK_CLAMP(0, cursor, gs->output_edit.string.len);
+    gs->output_edit.select_start =
+        NK_CLAMP(0, sel_start, gs->output_edit.string.len);
+    gs->output_edit.select_end =
+        NK_CLAMP(0, sel_end, gs->output_edit.string.len);
+    gs->output_edit.scrollbar = scrollbar;
+    gs->output_edit.active = active;
+    gs->output_edit.mode = NK_TEXT_EDIT_MODE_VIEW;
+}
+
+static int gui_output_edit_append_text(gui_state_t *gs,
+                                       const char *text, int len) {
+    if (len <= 0)
+        return 1;
+    return nk_str_append_text_char(&gs->output_edit.string, text, len) == len;
+}
+
+static int gui_output_edit_append_line(gui_state_t *gs,
+                                       const char *line, int line_len) {
+    if (!gs->output_edit_ready || !gs->output_edit_sync ||
+        gs->filter_rule_enabled)
+        return 0;
+    if (!gui_output_edit_append_text(gs, line, line_len))
+        return 0;
+    if (!gui_output_edit_append_text(gs, "\n", 1))
+        return 0;
+    gs->output_edit.cursor =
+        NK_CLAMP(0, gs->output_edit.cursor, gs->output_edit.string.len);
+    gs->output_edit.select_start =
+        NK_CLAMP(0, gs->output_edit.select_start, gs->output_edit.string.len);
+    gs->output_edit.select_end =
+        NK_CLAMP(0, gs->output_edit.select_end, gs->output_edit.string.len);
+    gs->output_edit.mode = NK_TEXT_EDIT_MODE_VIEW;
+    return 1;
+}
+
 static void gui_output_append_line(gui_state_t *gs, const ring_slot_t *slot) {
     int line_len = (int)strlen(slot->text);
     int need = line_len + 1;
+    int full_sync_needed = 0;
 
     if (need >= OUTPUT_TEXT_CAPACITY)
         return;
@@ -494,13 +537,16 @@ static void gui_output_append_line(gui_state_t *gs, const ring_slot_t *slot) {
         memmove(gs->output_text, gs->output_text + drop,
                 (size_t)(gs->output_text_len - drop));
         gs->output_text_len -= drop;
+        full_sync_needed = 1;
     }
 
     memcpy(gs->output_text + gs->output_text_len, slot->text, (size_t)line_len);
     gs->output_text_len += line_len;
     gs->output_text[gs->output_text_len++] = '\n';
     gs->output_text[gs->output_text_len] = '\0';
-    gs->output_edit_sync = 0;
+    if (full_sync_needed ||
+        !gui_output_edit_append_line(gs, slot->text, line_len))
+        gs->output_edit_sync = 0;
     gs->filtered_dirty = 1;
 }
 
@@ -520,20 +566,29 @@ static void gui_output_sync_edit(gui_state_t *gs) {
     {
     int disp_len = 0;
     const char *disp = gui_display_text(gs, &disp_len);
+    int cur_len = nk_str_len_char(&gs->output_edit.string);
 
-    if (gs->output_edit_sync &&
-        nk_str_len(&gs->output_edit.string) == disp_len)
-        return;
+    if (gs->output_edit_sync) {
+        const char *cur = nk_str_get_const(&gs->output_edit.string);
+        if (cur_len == disp_len)
+            return;
+        if (cur_len < disp_len &&
+            (cur_len == 0 || (cur && memcmp(cur, disp, (size_t)cur_len) == 0))) {
+            if (gui_output_edit_append_text(gs, disp + cur_len,
+                                            disp_len - cur_len)) {
+                gui_output_edit_restore_state(gs, cursor, sel_start, sel_end,
+                                              scrollbar, active);
+                gs->output_edit_sync = 1;
+                return;
+            }
+        }
+    }
 
     nk_str_clear(&gs->output_edit.string);
     nk_str_append_text_char(&gs->output_edit.string, disp, disp_len);
     }
-    gs->output_edit.cursor = NK_CLAMP(0, cursor, gs->output_edit.string.len);
-    gs->output_edit.select_start = NK_CLAMP(0, sel_start, gs->output_edit.string.len);
-    gs->output_edit.select_end = NK_CLAMP(0, sel_end, gs->output_edit.string.len);
-    gs->output_edit.scrollbar = scrollbar;
-    gs->output_edit.active = active;
-    gs->output_edit.mode = NK_TEXT_EDIT_MODE_VIEW;
+    gui_output_edit_restore_state(gs, cursor, sel_start, sel_end,
+                                  scrollbar, active);
     gs->output_edit_sync = 1;
 }
 
@@ -570,18 +625,6 @@ static void gui_output_edit_scroll_to_bottom(gui_state_t *gs, float edit_h) {
     gs->output_edit.scrollbar.y = bottom_y;
 }
 
-static int gui_output_edit_matches(gui_state_t *gs) {
-    const char *text = nk_str_get_const(&gs->output_edit.string);
-    int len = nk_str_len(&gs->output_edit.string);
-    int disp_len = 0;
-    const char *disp = gui_display_text(gs, &disp_len);
-    if (len != disp_len)
-        return 0;
-    if (len == 0)
-        return disp_len == 0;
-    return text && memcmp(text, disp, (size_t)len) == 0;
-}
-
 static void gui_output_copy_text(const char *text) {
 #ifdef _WIN32
     if (text)
@@ -611,6 +654,7 @@ static void gui_output_clear(gui_state_t *gs) {
     gs->filtered_dirty = 1;
     gs->packet_start = 0;
     gs->packet_count = 0;
+    gs->output_raw_scroll_pending = 1;
 }
 
 static unsigned gui_effective_buffer_size(const gui_state_t *gs) {
@@ -647,8 +691,12 @@ static void gui_apply_buffer_size(gui_state_t *gs, unsigned size) {
 }
 
 static void gui_output_scroll_to_bottom(gui_state_t *gs) {
-    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
-    nk_group_set_scroll(nk_ctx, SELECTABLE_LOG_PANEL_ID, 0, 0x7fffffffU);
+    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0);
+    gs->output_scroll_pending = 1;
+    gs->output_raw_scroll_pending = 1;
+}
+
+static void gui_log_scroll_to_bottom(gui_state_t *gs) {
     gs->output_scroll_pending = 1;
 }
 
@@ -1258,7 +1306,7 @@ static void gui_output_toolbar(gui_state_t *gs) {
     int was_auto_scroll = gs->auto_scroll_output;
     nk_checkbox_label(nk_ctx, "Auto-scroll", &gs->auto_scroll_output);
     if (!was_auto_scroll && gs->auto_scroll_output)
-        gui_output_scroll_to_bottom(gs);
+        gui_log_scroll_to_bottom(gs);
     nk_layout_row_push(nk_ctx, 88);
     if (nk_button_label(nk_ctx, "Copy All"))
         gui_output_copy_text(gs->output_text);
@@ -1322,7 +1370,7 @@ static void gui_panel_output(gui_state_t *gs) {
         nk_layout_row_dynamic(nk_ctx, 22, 1);
         nk_label_colored(nk_ctx, "(no packets yet)", NK_TEXT_LEFT, gui_colors[1]);
     }
-    for (int n = packet_count - 1; n >= 0; n--) {
+    for (int n = 0; n < packet_count; n++) {
         const output_packet_t *packet = &packet_view[n];
         struct nk_color c = gui_colors[packet->color % 9];
 
@@ -1380,14 +1428,12 @@ static void gui_panel_selectable_log(gui_state_t *gs, float panel_h) {
             gs->filtered_dirty = 1;
             gs->output_edit_sync = 0;
             if (gs->filter_rule_enabled)
-                gui_output_scroll_to_bottom(gs);
+                gui_log_scroll_to_bottom(gs);
         }
     }
 
-    if (!gui_output_edit_matches(gs)) {
-        gs->output_edit_sync = 0;
+    if (!gs->output_edit_sync)
         gui_output_sync_edit(gs);
-    }
     if (gs->output_scroll_pending)
         gui_output_edit_scroll_to_bottom(gs, edit_h);
     nk_layout_row_dynamic(nk_ctx, edit_h, 1);
@@ -1466,7 +1512,7 @@ int main(int argc, char *argv[]) {
                 added = gui_output_drain(&gs);
                 gui_output_sync_edit(&gs);
                 if (added && gs.auto_scroll_output) {
-                    gui_output_scroll_to_bottom(&gs);
+                    gui_log_scroll_to_bottom(&gs);
                     scroll_after_layout = 1;
                 }
 
@@ -1500,16 +1546,18 @@ int main(int argc, char *argv[]) {
                                                      toolbar_h + output_h + gap_h,
                                                      right_w, log_h));
                 if (nk_group_begin(nk_ctx, SELECTABLE_LOG_PANEL_ID,
-                                   NK_WINDOW_BORDER)) {
+                                   NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR)) {
                     gui_panel_selectable_log(&gs, log_h);
                     nk_group_end(nk_ctx);
                 }
                 nk_layout_space_end(nk_ctx);
 
                 if (scroll_after_layout || gs.output_scroll_pending) {
-                    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
-                    nk_group_set_scroll(nk_ctx, SELECTABLE_LOG_PANEL_ID, 0, 0x7fffffffU);
                     gs.output_scroll_pending = 0;
+                }
+                if (gs.output_raw_scroll_pending) {
+                    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0);
+                    gs.output_raw_scroll_pending = 0;
                 }
             }
         }

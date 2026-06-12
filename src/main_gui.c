@@ -93,6 +93,7 @@
 #define OUTPUT_PACKET_CAPACITY 128
 #define PACKET_HEX_CAPACITY (USP_MAX_BUFFER_SIZE * 3 + 32)
 #define PACKET_HEX_PREVIEW_CHARS (BUF_SIZE * 3)
+#define PACKET_HEX_PREVIEW_ROWS 2
 #define OUTPUT_TOOLBAR_ID "output_toolbar"
 #define OUTPUT_PANEL_ID "output_panel"
 #define SELECTABLE_LOG_PANEL_ID "selectable_log_panel"
@@ -351,6 +352,8 @@ typedef struct {
     output_packet_t packets[OUTPUT_PACKET_CAPACITY];
     int   packet_start;
     int   packet_count;
+    unsigned packet_version;
+    unsigned output_raw_seen_packet_version;
     int   auto_scroll_output;
 
     /* selectable-log rule filter */
@@ -652,9 +655,15 @@ static void gui_output_clear(gui_state_t *gs) {
     gs->filtered_text_len = 0;
     gs->filtered_text[0] = '\0';
     gs->filtered_dirty = 1;
+
+    packet_lock_enter();
     gs->packet_start = 0;
     gs->packet_count = 0;
-    gs->output_raw_scroll_pending = 1;
+    gs->packet_version++;
+    gs->output_raw_seen_packet_version = gs->packet_version;
+    packet_lock_leave();
+
+    gs->output_raw_scroll_pending = 0;
 }
 
 static unsigned gui_effective_buffer_size(const gui_state_t *gs) {
@@ -691,7 +700,6 @@ static void gui_apply_buffer_size(gui_state_t *gs, unsigned size) {
 }
 
 static void gui_output_scroll_to_bottom(gui_state_t *gs) {
-    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0);
     gs->output_scroll_pending = 1;
     gs->output_raw_scroll_pending = 1;
 }
@@ -732,6 +740,7 @@ static void gui_packet_append(gui_state_t *gs, const char *label, int color,
         packet->truncated = 1;
         snprintf(packet->hex + pos, sizeof(packet->hex) - (size_t)pos, " ...");
     }
+    gs->packet_version++;
     packet_lock_leave();
 }
 
@@ -756,12 +765,20 @@ static int gui_packet_snapshot(gui_state_t *gs,
     if (count > max_count)
         count = max_count;
     for (int n = 0; n < count; n++) {
-        int src = gs->packet_count - 1 - n;
+        int src = gs->packet_count - count + n;
         int idx = (gs->packet_start + src) % OUTPUT_PACKET_CAPACITY;
         out[n] = gs->packets[idx];
     }
     packet_lock_leave();
     return count;
+}
+
+static unsigned gui_packet_version(gui_state_t *gs) {
+    unsigned version;
+    packet_lock_enter();
+    version = gs->packet_version;
+    packet_lock_leave();
+    return version;
 }
 
 static int gui_port_exists(gui_state_t *gs, const char *port) {
@@ -1012,6 +1029,34 @@ static void gui_style_toggles(struct nk_context *ctx) {
     toggle->text_normal = text;
     toggle->text_hover = nk_rgb(255, 255, 255);
     toggle->text_active = nk_rgb(255, 255, 255);
+
+    {
+        struct nk_style_scrollbar scroll = ctx->style.scrollv;
+        struct nk_color track = nk_rgb(42, 48, 56);
+        struct nk_color thumb = nk_rgb(150, 170, 190);
+        struct nk_color thumb_hover = nk_rgb(185, 205, 225);
+
+        scroll.normal = nk_style_item_color(track);
+        scroll.hover = nk_style_item_color(track);
+        scroll.active = nk_style_item_color(track);
+        scroll.cursor_normal = nk_style_item_color(thumb);
+        scroll.cursor_hover = nk_style_item_color(thumb_hover);
+        scroll.cursor_active = nk_style_item_color(thumb_hover);
+        scroll.border_color = track;
+        scroll.cursor_border_color = thumb_hover;
+        scroll.border = 0.0f;
+        scroll.rounding = 0.0f;
+        scroll.border_cursor = 0.0f;
+        scroll.rounding_cursor = 2.0f;
+        scroll.padding = nk_vec2(0.0f, 0.0f);
+        scroll.show_buttons = 0;
+
+        ctx->style.scrollv = scroll;
+        ctx->style.scrollh = scroll;
+        ctx->style.window.scrollbar_size = nk_vec2(14.0f, 14.0f);
+        ctx->style.edit.scrollbar = scroll;
+        ctx->style.edit.scrollbar_size = ctx->style.window.scrollbar_size;
+    }
 }
 
 static void nuklear_sdl_init(void) {
@@ -1306,7 +1351,7 @@ static void gui_output_toolbar(gui_state_t *gs) {
     int was_auto_scroll = gs->auto_scroll_output;
     nk_checkbox_label(nk_ctx, "Auto-scroll", &gs->auto_scroll_output);
     if (!was_auto_scroll && gs->auto_scroll_output)
-        gui_log_scroll_to_bottom(gs);
+        gui_output_scroll_to_bottom(gs);
     nk_layout_row_push(nk_ctx, 88);
     if (nk_button_label(nk_ctx, "Copy All"))
         gui_output_copy_text(gs->output_text);
@@ -1316,32 +1361,42 @@ static void gui_output_toolbar(gui_state_t *gs) {
     nk_layout_row_end(nk_ctx);
 }
 
-static void gui_label_hex_wrapped(const char *hex, struct nk_color color) {
+static void gui_label_hex_wrapped(const char *hex, struct nk_color color,
+                                  int max_rows) {
     struct nk_vec2 region = nk_window_get_content_region_size(nk_ctx);
     int chars_per_line = (int)(region.x / 9.0f);
     const char *p = hex;
     int shown = 0;
+    int rows = 0;
     if (chars_per_line < 24)
         chars_per_line = 24;
     chars_per_line -= chars_per_line % 3;
     if (chars_per_line > 96)
         chars_per_line = 96;
 
-    while (*p && shown < PACKET_HEX_PREVIEW_CHARS) {
+    while (*p && shown < PACKET_HEX_PREVIEW_CHARS && rows < max_rows) {
         char line[112];
+        const char *next;
         int take = 0;
         int remain = PACKET_HEX_PREVIEW_CHARS - shown;
         int limit = chars_per_line < remain ? chars_per_line : remain;
+        int truncated = 0;
         while (p[take] && p[take] != '\n' && take < limit)
             take++;
         while (take > 3 && p[take] && p[take] != ' ')
             take--;
         if (take <= 0)
-            take = (int)strlen(p);
-        if (take > (int)sizeof(line) - 1)
-            take = (int)sizeof(line) - 1;
+            take = limit;
+        if (take > (int)sizeof(line) - 6)
+            take = (int)sizeof(line) - 6;
+        next = p + take;
+        while (*next == ' ')
+            next++;
+        truncated = (rows + 1 >= max_rows) && *next;
         memcpy(line, p, (size_t)take);
         line[take] = '\0';
+        if (truncated)
+            snprintf(line + take, sizeof(line) - (size_t)take, " ...");
 
         nk_layout_row_dynamic(nk_ctx, 18, 1);
         nk_label_colored(nk_ctx, line, NK_TEXT_LEFT, color);
@@ -1350,11 +1405,7 @@ static void gui_label_hex_wrapped(const char *hex, struct nk_color color) {
         shown += take;
         while (*p == ' ')
             p++;
-    }
-
-    if (*p) {
-        nk_layout_row_dynamic(nk_ctx, 18, 1);
-        nk_label_colored(nk_ctx, "...", NK_TEXT_LEFT, color);
+        rows++;
     }
 }
 
@@ -1373,6 +1424,10 @@ static void gui_panel_output(gui_state_t *gs) {
     for (int n = 0; n < packet_count; n++) {
         const output_packet_t *packet = &packet_view[n];
         struct nk_color c = gui_colors[packet->color % 9];
+        struct nk_vec2 region = nk_window_get_content_region_size(nk_ctx);
+        float title_w = region.x - 92.0f - 94.0f - 18.0f;
+        if (title_w < 120.0f)
+            title_w = 120.0f;
 
         nk_layout_row_begin(nk_ctx, NK_STATIC, 22, 3);
         nk_layout_row_push(nk_ctx, 92);
@@ -1390,11 +1445,11 @@ static void gui_panel_output(gui_state_t *gs) {
                 free(line);
             }
         }
-        nk_layout_row_push(nk_ctx, 520);
+        nk_layout_row_push(nk_ctx, title_w);
         nk_label_colored(nk_ctx, packet->title, NK_TEXT_LEFT, c);
         nk_layout_row_end(nk_ctx);
 
-        gui_label_hex_wrapped(packet->hex, c);
+        gui_label_hex_wrapped(packet->hex, c, PACKET_HEX_PREVIEW_ROWS);
     }
 }
 
@@ -1486,9 +1541,11 @@ int main(int argc, char *argv[]) {
                 float toolbar_h = 32.0f;
                 float split_h;
                 float output_h;
+                float output_panel_w;
+                float raw_scroll_gutter;
                 float log_h;
                 int added;
-                int scroll_after_layout = 0;
+                unsigned packet_version;
                 if (right_w < 420.0f) right_w = 420.0f;
                 if (panel_h < 120.0f) panel_h = 120.0f;
 
@@ -1508,13 +1565,15 @@ int main(int argc, char *argv[]) {
                         output_h = split_h - 120.0f;
                 }
                 log_h = split_h - output_h;
+                raw_scroll_gutter = nk_ctx->style.window.scrollbar_size.x +
+                                    nk_ctx->style.window.group_padding.x + 2.0f;
+                output_panel_w = right_w - raw_scroll_gutter;
+                if (output_panel_w < 260.0f)
+                    output_panel_w = right_w;
 
                 added = gui_output_drain(&gs);
+                packet_version = gui_packet_version(&gs);
                 gui_output_sync_edit(&gs);
-                if (added && gs.auto_scroll_output) {
-                    gui_log_scroll_to_bottom(&gs);
-                    scroll_after_layout = 1;
-                }
 
                 nk_layout_space_begin(nk_ctx, NK_STATIC, panel_h, 4);
                 nk_layout_space_push(nk_ctx, nk_rect(0, 0, left_w, panel_h));
@@ -1535,8 +1594,16 @@ int main(int argc, char *argv[]) {
                     nk_group_end(nk_ctx);
                 }
 
+                if (added && gs.auto_scroll_output)
+                    gui_log_scroll_to_bottom(&gs);
+                if (packet_version != gs.output_raw_seen_packet_version) {
+                    if (gs.auto_scroll_output)
+                        gs.output_raw_scroll_pending = 1;
+                    gs.output_raw_seen_packet_version = packet_version;
+                }
+
                 nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f, toolbar_h,
-                                                     right_w, output_h));
+                                                     output_panel_w, output_h));
                 if (nk_group_begin(nk_ctx, OUTPUT_PANEL_ID, NK_WINDOW_BORDER)) {
                     gui_panel_output(&gs);
                     nk_group_end(nk_ctx);
@@ -1552,11 +1619,11 @@ int main(int argc, char *argv[]) {
                 }
                 nk_layout_space_end(nk_ctx);
 
-                if (scroll_after_layout || gs.output_scroll_pending) {
+                if (gs.output_scroll_pending) {
                     gs.output_scroll_pending = 0;
                 }
                 if (gs.output_raw_scroll_pending) {
-                    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0);
+                    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
                     gs.output_raw_scroll_pending = 0;
                 }
             }

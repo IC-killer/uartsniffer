@@ -10,6 +10,10 @@
 - 支持log记录
 - 跨平台，待测试
 
+## 编译
+
+- make all
+
 ## 使用
 
 - cli监听：`./uartsniffer.exe -i COM6 -o COM7 -b 115200`

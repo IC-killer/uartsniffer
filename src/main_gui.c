@@ -349,6 +349,7 @@ typedef struct {
     int   output_edit_sync;
     int   output_scroll_pending;
     int   output_raw_scroll_pending;
+    struct nk_scroll output_raw_scroll;
     output_packet_t packets[OUTPUT_PACKET_CAPACITY];
     int   packet_start;
     int   packet_count;
@@ -606,6 +607,14 @@ static int gui_output_line_count(gui_state_t *gs) {
     return lines;
 }
 
+static float gui_output_edit_text_height(gui_state_t *gs) {
+    const struct nk_style_edit *style = &nk_ctx->style.edit;
+    const struct nk_user_font *font = nk_ctx->style.font;
+    if (!font)
+        return 0.0f;
+    return (float)gui_output_line_count(gs) * (font->height + style->row_padding);
+}
+
 static void gui_output_edit_scroll_to_bottom(gui_state_t *gs, float edit_h) {
     const struct nk_style_edit *style = &nk_ctx->style.edit;
     const struct nk_user_font *font = nk_ctx->style.font;
@@ -622,7 +631,7 @@ static void gui_output_edit_scroll_to_bottom(gui_state_t *gs, float edit_h) {
     if (visible_h < row_height)
         visible_h = row_height;
 
-    text_h = (float)gui_output_line_count(gs) * row_height;
+    text_h = gui_output_edit_text_height(gs);
     bottom_y = text_h > visible_h ? text_h - visible_h : 0.0f;
     gs->output_edit.scrollbar.x = 0.0f;
     gs->output_edit.scrollbar.y = bottom_y;
@@ -664,6 +673,8 @@ static void gui_output_clear(gui_state_t *gs) {
     packet_lock_leave();
 
     gs->output_raw_scroll_pending = 0;
+    gs->output_raw_scroll.x = 0;
+    gs->output_raw_scroll.y = 0;
 }
 
 static unsigned gui_effective_buffer_size(const gui_state_t *gs) {
@@ -1409,6 +1420,74 @@ static void gui_label_hex_wrapped(const char *hex, struct nk_color color,
     }
 }
 
+static int gui_packet_hex_row_count(const char *hex, float content_w,
+                                    int max_rows) {
+    int chars_per_line = (int)(content_w / 9.0f);
+    const char *p = hex;
+    int shown = 0;
+    int rows = 0;
+    if (chars_per_line < 24)
+        chars_per_line = 24;
+    chars_per_line -= chars_per_line % 3;
+    if (chars_per_line > 96)
+        chars_per_line = 96;
+
+    while (*p && shown < PACKET_HEX_PREVIEW_CHARS && rows < max_rows) {
+        int take = 0;
+        int remain = PACKET_HEX_PREVIEW_CHARS - shown;
+        int limit = chars_per_line < remain ? chars_per_line : remain;
+        while (p[take] && p[take] != '\n' && take < limit)
+            take++;
+        while (take > 3 && p[take] && p[take] != ' ')
+            take--;
+        if (take <= 0)
+            take = limit;
+        p += take;
+        shown += take;
+        while (*p == ' ')
+            p++;
+        rows++;
+    }
+    return rows;
+}
+
+static nk_uint gui_raw_bottom_scroll(gui_state_t *gs, float panel_h) {
+    const struct nk_style_window *style = &nk_ctx->style.window;
+    float spacing_y = style->spacing.y;
+    float content_w = nk_window_get_content_region_size(nk_ctx).x;
+    float visible_h;
+    float content_h;
+    int count;
+
+    visible_h = panel_h - (2.0f * style->group_border) -
+                style->scrollbar_size.y;
+    if (visible_h < 1.0f)
+        visible_h = 1.0f;
+
+    content_h = style->group_padding.y + 20.0f + spacing_y;
+
+    packet_lock_enter();
+    count = gs->packet_count;
+    if (count == 0) {
+        content_h += 22.0f + spacing_y;
+    } else {
+        for (int n = 0; n < count; n++) {
+            int src = gs->packet_count - count + n;
+            int idx = (gs->packet_start + src) % OUTPUT_PACKET_CAPACITY;
+            int rows = gui_packet_hex_row_count(gs->packets[idx].hex,
+                                                content_w,
+                                                PACKET_HEX_PREVIEW_ROWS);
+            content_h += 22.0f + spacing_y;
+            content_h += (float)rows * (18.0f + spacing_y);
+        }
+    }
+    packet_lock_leave();
+
+    if (content_h <= visible_h)
+        return 0;
+    return (nk_uint)(content_h - visible_h + 0.5f);
+}
+
 static void gui_panel_output(gui_state_t *gs) {
     static output_packet_t packet_view[OUTPUT_PACKET_CAPACITY];
     int packet_count;
@@ -1453,8 +1532,46 @@ static void gui_panel_output(gui_state_t *gs) {
     }
 }
 
+static void gui_draw_selectable_log_scrollbar(gui_state_t *gs,
+                                              struct nk_rect edit_bounds) {
+    const struct nk_style_edit *style = &nk_ctx->style.edit;
+    struct nk_command_buffer *canvas = nk_window_get_canvas(nk_ctx);
+    struct nk_rect scroll;
+    float text_h = gui_output_edit_text_height(gs);
+    float visible_h;
+    float max_scroll;
+    nk_flags state = 0;
+
+    if (!canvas)
+        return;
+
+    scroll.x = (edit_bounds.x + edit_bounds.w - style->border) -
+               style->scrollbar_size.x;
+    scroll.y = edit_bounds.y + style->padding.y + style->border;
+    scroll.w = style->scrollbar_size.x;
+    scroll.h = edit_bounds.h - (2.0f * style->padding.y + 2.0f * style->border);
+    if (scroll.h < 1.0f)
+        return;
+
+    visible_h = scroll.h;
+    max_scroll = text_h > visible_h ? text_h - visible_h : 0.0f;
+    if (gs->output_edit.scrollbar.y > max_scroll)
+        gs->output_edit.scrollbar.y = max_scroll;
+    if (gs->output_edit.scrollbar.y < 0.0f)
+        gs->output_edit.scrollbar.y = 0.0f;
+
+    gs->output_edit.scrollbar.y =
+        nk_do_scrollbarv(&state, canvas, scroll,
+                         nk_input_is_mouse_hovering_rect(&nk_ctx->input, scroll),
+                         gs->output_edit.scrollbar.y, text_h,
+                         scroll.h * 0.10f, scroll.h * 0.01f,
+                         &style->scrollbar, &nk_ctx->input,
+                         nk_ctx->style.font);
+}
+
 static void gui_panel_selectable_log(gui_state_t *gs, float panel_h) {
     float edit_h = panel_h - 44.0f;
+    struct nk_rect edit_bounds;
     if (edit_h < 80.0f)
         edit_h = 80.0f;
 
@@ -1492,10 +1609,13 @@ static void gui_panel_selectable_log(gui_state_t *gs, float panel_h) {
     if (gs->output_scroll_pending)
         gui_output_edit_scroll_to_bottom(gs, edit_h);
     nk_layout_row_dynamic(nk_ctx, edit_h, 1);
+    nk_layout_peek(&edit_bounds, nk_ctx);
     nk_edit_buffer(nk_ctx,
                    NK_EDIT_EDITOR | NK_EDIT_NO_CURSOR,
                    &gs->output_edit, nk_filter_default);
     gs->output_edit.mode = NK_TEXT_EDIT_MODE_VIEW;
+    if (!gs->output_edit.active)
+        gui_draw_selectable_log_scrollbar(gs, edit_bounds);
 }
 
 /* ==========================================================================
@@ -1604,9 +1724,17 @@ int main(int argc, char *argv[]) {
 
                 nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f, toolbar_h,
                                                      output_panel_w, output_h));
-                if (nk_group_begin(nk_ctx, OUTPUT_PANEL_ID, NK_WINDOW_BORDER)) {
+                if (nk_group_scrolled_begin(nk_ctx, &gs.output_raw_scroll,
+                                            OUTPUT_PANEL_ID,
+                                            NK_WINDOW_BORDER)) {
+                    if (gs.output_raw_scroll_pending) {
+                        gs.output_raw_scroll.x = 0;
+                        gs.output_raw_scroll.y =
+                            gui_raw_bottom_scroll(&gs, output_h);
+                        gs.output_raw_scroll_pending = 0;
+                    }
                     gui_panel_output(&gs);
-                    nk_group_end(nk_ctx);
+                    nk_group_scrolled_end(nk_ctx);
                 }
 
                 nk_layout_space_push(nk_ctx, nk_rect(left_w + 8.0f,
@@ -1621,10 +1749,6 @@ int main(int argc, char *argv[]) {
 
                 if (gs.output_scroll_pending) {
                     gs.output_scroll_pending = 0;
-                }
-                if (gs.output_raw_scroll_pending) {
-                    nk_group_set_scroll(nk_ctx, OUTPUT_PANEL_ID, 0, 0x7fffffffU);
-                    gs.output_raw_scroll_pending = 0;
                 }
             }
         }

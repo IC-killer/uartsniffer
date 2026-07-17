@@ -1070,6 +1070,23 @@ static void gui_style_toggles(struct nk_context *ctx) {
     }
 }
 
+static SDL_Surface *gui_load_icon(void) {
+    SDL_Surface *icon = NULL;
+    char path[512];
+    char *base = SDL_GetBasePath();
+
+    if (base) {
+        snprintf(path, sizeof(path), "%sassets/uartsniffer-icon.bmp", base);
+        icon = SDL_LoadBMP(path);
+        SDL_free(base);
+    }
+    if (!icon)
+        icon = SDL_LoadBMP("assets/uartsniffer-icon.bmp");
+    if (!icon)
+        icon = SDL_LoadBMP("../assets/uartsniffer-icon.bmp");
+    return icon;
+}
+
 static void nuklear_sdl_init(void) {
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
@@ -1082,6 +1099,13 @@ static void nuklear_sdl_init(void) {
                            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                            win_w, win_h,
                            SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    {
+        SDL_Surface *icon = gui_load_icon();
+        if (icon) {
+            SDL_SetWindowIcon(win, icon);
+            SDL_FreeSurface(icon);
+        }
+    }
     gl_ctx = SDL_GL_CreateContext(win);
     SDL_GL_SetSwapInterval(1);   /* vsync: throttle redraws, stop tearing/flicker */
 

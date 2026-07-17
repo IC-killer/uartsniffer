@@ -21,6 +21,10 @@ add_executable(uartsniffer
     src/main_cli.c
 )
 
+if(WIN32)
+    target_sources(uartsniffer PRIVATE resources/uartsniffer.rc)
+endif()
+
 target_include_directories(uartsniffer PRIVATE src)
 
 if(WIN32)
@@ -38,6 +42,9 @@ if(SDL2_FOUND)
         ${COMMON_SRCS}
         src/main_gui.c
     )
+    if(WIN32)
+        target_sources(uartsniffer-gui PRIVATE resources/uartsniffer.rc)
+    endif()
     target_include_directories(uartsniffer-gui PRIVATE
         src ${CMAKE_SOURCE_DIR}/vendor
     )
@@ -55,6 +62,13 @@ if(SDL2_FOUND)
             WIN32_EXECUTABLE TRUE
         )
     endif()
+    add_custom_command(TARGET uartsniffer-gui POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:uartsniffer-gui>/assets"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/assets/uartsniffer-icon.bmp"
+            "$<TARGET_FILE_DIR:uartsniffer-gui>/assets/uartsniffer-icon.bmp"
+    )
 else()
     message(STATUS "SDL2 not found – GUI target skipped.")
 endif()

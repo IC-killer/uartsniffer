@@ -43,6 +43,8 @@ else
     LDFLAGS_GUI  = -lSDL2 -lopengl32 -lkernel32 -lsetupapi -luuid -lcomdlg32 -mwindows
     CLI_EXE      = uartsniffer.exe
     GUI_EXE      = uartsniffer-gui.exe
+    WINDRES      ?= windres
+    RESOURCE_OBJ = uartsniffer-icon-res.o
 endif
 
 # ── source files ───────────────────────────────────────────────────────────
@@ -75,14 +77,19 @@ cli: $(CLI_EXE)
 
 gui: $(GUI_EXE)
 
-$(CLI_EXE): $(CLI_SRCS) $(SRCDIR)/uspy.h
-	$(CC) $(CFLAGS) $(DEFINES) -o $@ $(CLI_SRCS) $(LDFLAGS_CLI)
+$(CLI_EXE): $(CLI_SRCS) $(SRCDIR)/uspy.h $(RESOURCE_OBJ)
+	$(CC) $(CFLAGS) $(DEFINES) -o $@ $(CLI_SRCS) $(RESOURCE_OBJ) $(LDFLAGS_CLI)
 
-$(GUI_EXE): $(GUI_SRCS) $(SRCDIR)/uspy.h vendor/nuklear.h vendor/nuklear_sdl_gl2.h
-	$(CC) $(CFLAGS) $(DEFINES) -o $@ $(GUI_SRCS) $(LDFLAGS_GUI)
+$(GUI_EXE): $(GUI_SRCS) $(SRCDIR)/uspy.h vendor/nuklear.h vendor/nuklear_sdl_gl2.h $(RESOURCE_OBJ)
+	$(CC) $(CFLAGS) $(DEFINES) -o $@ $(GUI_SRCS) $(RESOURCE_OBJ) $(LDFLAGS_GUI)
+
+ifeq ($(PLATFORM),Windows)
+uartsniffer-icon-res.o: resources/uartsniffer.rc assets/uartsniffer.ico
+	$(WINDRES) resources/uartsniffer.rc -O coff -o $@
+endif
 
 clean:
-	rm -f $(CLI_EXE) $(GUI_EXE)
+	rm -f $(CLI_EXE) $(GUI_EXE) $(RESOURCE_OBJ)
 
 # ── vendor download helper ─────────────────────────────────────────────────
 
